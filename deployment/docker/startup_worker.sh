@@ -216,7 +216,7 @@ echo ""
 
 # Uruchom Worker Service w tle
 echo "🚀 Uruchamianie Tesla Worker Service..."
-python3 cloud_tesla_worker.py &
+python3 -m src.worker.worker_service &
 
 # Zapisz PID procesu głównego
 WORKER_PID=$!

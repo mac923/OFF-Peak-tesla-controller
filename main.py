@@ -1,1 +1,1 @@
-from tesla_scout_function import tesla_scout_main 
+from src.scout.scout_function import tesla_scout_main 

@@ -19,7 +19,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Import Fleet API - wymagany
 try:
-    from tesla_fleet_api_client import TeslaFleetAPIClient, TeslaAuthenticationError
+    from src.core.tesla_fleet_api_client import TeslaFleetAPIClient, TeslaAuthenticationError
     FLEET_API_AVAILABLE = True
 except ImportError:
     FLEET_API_AVAILABLE = False

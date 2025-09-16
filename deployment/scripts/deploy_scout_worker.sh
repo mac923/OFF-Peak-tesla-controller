@@ -111,10 +111,10 @@ echo "🔧 === WDRAŻANIE WORKER SERVICE (CIĘŻKA, DROGA, RZADKA) ==="
 
 # Buduj obraz Worker (używamy Dockerfile.worker)
 echo "🏗️ Budowanie obrazu Worker..."
-gcloud builds submit --config=cloudbuild-worker.yaml .
+gcloud builds submit --config=deployment/docker/cloudbuild-worker.yaml .
 
 # Zastąp placeholders w konfiguracji Worker
-sed "s/YOUR_PROJECT_ID/$PROJECT_ID/g" cloud-run-service-worker.yaml > cloud-run-service-worker-filled.yaml
+sed "s/YOUR_PROJECT_ID/$PROJECT_ID/g" deployment/cloud/cloud-run-worker.yaml > cloud-run-service-worker-filled.yaml
 
 # Wdrażaj Worker Service
 echo "🔧 Wdrażanie Worker Service..."
@@ -139,7 +139,7 @@ gcloud functions deploy tesla-scout \
     --gen2 \
     --runtime=python311 \
     --region=europe-west1 \
-    --source=scout_function_deploy \
+    --source=src/scout \
     --entry-point=tesla_scout_main \
     --trigger-http \
     --no-allow-unauthenticated \
@@ -194,7 +194,7 @@ echo "📅 Konfiguracja Cloud Scheduler..."
 sed -e "s/YOUR_PROJECT_ID/$PROJECT_ID/g" \
     -e "s|YOUR_SCOUT_FUNCTION_URL|$SCOUT_FUNCTION_URL|g" \
     -e "s|YOUR_WORKER_SERVICE_URL|$WORKER_SERVICE_URL|g" \
-    cloud-scheduler-scout-worker.yaml > cloud-scheduler-scout-worker-filled.yaml
+    deployment/cloud/scheduler-scout-worker.yaml > cloud-scheduler-scout-worker-filled.yaml
 
 # Utwórz region dla Cloud Scheduler jeśli nie istnieje
 gcloud app create --region=europe-west1 2>/dev/null || true

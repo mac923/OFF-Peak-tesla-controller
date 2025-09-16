@@ -28,15 +28,15 @@ from google.oauth2.service_account import Credentials
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from cloud_tesla_monitor import (
+    from src.worker.monitor import (
         CloudTeslaMonitor,
         HealthCheckHandler,
         get_secret,
         _log_simple_status
     )
-    from tesla_controller import ChargeSchedule
+    from src.core.tesla_controller import ChargeSchedule
 except ImportError as e:
-    logging.error(f"❌ Błąd importu z cloud_tesla_monitor.py: {e}")
+    logging.error(f"❌ Błąd importu z src.worker.monitor: {e}")
     sys.exit(1)
 
 from http.server import HTTPServer, BaseHTTPRequestHandler

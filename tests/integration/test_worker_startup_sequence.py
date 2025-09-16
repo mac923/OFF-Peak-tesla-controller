@@ -14,7 +14,7 @@ import logging
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import z naprawionych modułów
-from cloud_tesla_worker import CloudTeslaWorker, WorkerHealthCheckHandler
+from src.worker.worker_service import CloudTeslaWorker, WorkerHealthCheckHandler
 
 class TestWorkerStartupSequence(unittest.TestCase):
     """Test naprawek Worker Service startup sequence"""

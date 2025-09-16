@@ -1,0 +1,39 @@
+# Google Cloud Build configuration dla Tesla Worker Service
+# Część architektury "Scout & Worker" dla agresywnej optymalizacji kosztów
+
+steps:
+  # Build Tesla Worker Service Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: [
+      'build',
+      '-f', 'deployment/docker/Dockerfile.worker',
+      '-t', 'gcr.io/$PROJECT_ID/tesla-worker:latest',
+      '-t', 'gcr.io/$PROJECT_ID/tesla-worker:$BUILD_ID',
+      '.'
+    ]
+
+  # Push Docker image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/tesla-worker:latest']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/tesla-worker:$BUILD_ID']
+
+# Store images in Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/tesla-worker:latest'
+  - 'gcr.io/$PROJECT_ID/tesla-worker:$BUILD_ID'
+
+# Build configuration
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_STANDARD_2'
+
+# Timeout for build process
+timeout: '1200s'
+
+# Tags for build identification
+tags:
+  - 'tesla-worker'
+  - 'scout-worker-architecture'
+  - 'cost-optimized' 

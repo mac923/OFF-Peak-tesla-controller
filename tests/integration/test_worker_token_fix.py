@@ -23,7 +23,7 @@ def test_worker_token_refresh():
         logger.info("🔧 [TEST] Test naprawki mechanizmu odświeżania tokenów w Worker Service")
         
         # Import Worker Service
-        from cloud_tesla_worker import CloudTeslaWorker
+        from src.worker.worker_service import CloudTeslaWorker
         
         logger.info("✅ [TEST] CloudTeslaWorker zaimportowany pomyślnie")
         
@@ -85,7 +85,7 @@ def test_token_methods():
     try:
         logger.info("🔍 [TEST] Testowanie dostępności metod tokenów...")
         
-        from tesla_fleet_api_client import TeslaFleetAPIClient
+        from src.core.tesla_fleet_api_client import TeslaFleetAPIClient
         
         # Sprawdź czy wszystkie potrzebne metody istnieją
         required_methods = [

@@ -31,7 +31,7 @@ def check_requirements():
         import click
         import rich
         from dotenv import load_dotenv
-        from tesla_fleet_api_client import TeslaFleetAPIClient
+        from src.core.tesla_fleet_api_client import TeslaFleetAPIClient
         return True
     except ImportError as e:
         console.print(f"[red]Błąd: Brak wymaganej biblioteki: {e}[/red]")

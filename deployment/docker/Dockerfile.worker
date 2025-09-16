@@ -43,17 +43,14 @@ COPY --from=proxy-builder /tmp/vehicle-command/tesla-http-proxy /usr/local/bin/t
 RUN chmod +x /usr/local/bin/tesla-http-proxy
 
 # Skopiuj wymagania i zainstaluj zależności
-COPY requirements_cloud.txt .
-RUN pip install --no-cache-dir -r requirements_cloud.txt
+COPY src/worker/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Skopiuj kod aplikacji
-COPY cloud_tesla_monitor.py .
-COPY cloud_tesla_worker.py .
-COPY tesla_controller.py .
-COPY tesla_fleet_api_client.py .
+COPY src/ ./src/
 
 # Skopiuj startup script
-COPY startup_worker.sh .
+COPY deployment/docker/startup_worker.sh .
 RUN chmod +x startup_worker.sh
 
 # Ustaw zmienne środowiskowe dla Worker Service

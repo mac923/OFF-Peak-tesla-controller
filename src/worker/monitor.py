@@ -65,8 +65,8 @@ from google.cloud import logging as cloud_logging
 from google.cloud import storage
 from google.cloud import firestore
 from dotenv import load_dotenv
-from tesla_controller import TeslaController, ChargeSchedule
-from tesla_fleet_api_client import TeslaAuthenticationError
+from src.core.tesla_controller import TeslaController, ChargeSchedule
+from src.core.tesla_fleet_api_client import TeslaAuthenticationError
 from google.cloud import secretmanager
 # BEZPIECZEŃSTWO: Wyłączenie ostrzeżeń SSL dla Tesla HTTP Proxy
 # Tesla HTTP Proxy (localhost) używa self-signed certyfikatów SSL

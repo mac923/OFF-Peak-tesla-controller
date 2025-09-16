@@ -8,7 +8,7 @@ import click
 import sys
 from rich.console import Console
 from rich.prompt import Prompt, Confirm
-from tesla_controller import TeslaController, ChargeSchedule
+from src.core.tesla_controller import TeslaController, ChargeSchedule
 
 console = Console()
 
