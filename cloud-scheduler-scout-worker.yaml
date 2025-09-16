@@ -1,0 +1,125 @@
+# Cloud Scheduler Jobs dla architektury "Scout & Worker"
+# AGRESYWNA OPTYMALIZACJA KOSZTÓW:
+# - Scout Function: tania, częsta (co 15 min) - tylko sprawdza lokalizację
+# - Worker Service: droga, rzadka (2-3x dziennie) - pełna logika z proxy
+
+# 1. SCOUT JOB - Główny harmonogram (co 15 minut)
+# Wywołuje lekką Cloud Function która sprawdza tylko lokalizację pojazdu
+apiVersion: cloudscheduler.googleapis.com/v1
+kind: Job
+metadata:
+  name: tesla-scout-location-check
+  project: YOUR_PROJECT_ID
+spec:
+  schedule: "*/15 * * * *"  # Co 15 minut, 24/7
+  timeZone: "Europe/Warsaw"
+  description: "Tesla Scout - lekka funkcja sprawdzająca lokalizację (koszt: ~0.01 groszy)"
+  httpTarget:
+    uri: "YOUR_SCOUT_FUNCTION_URL"
+    httpMethod: POST
+    headers:
+      Content-Type: "application/json"
+      User-Agent: "Google-Cloud-Scheduler"
+    body: |
+      {
+        "trigger": "cloud_scheduler_scout",
+        "action": "check_location",
+        "frequency": "15min"
+      }
+    oidcToken:
+      serviceAccountEmail: "YOUR_PROJECT_ID@appspot.gserviceaccount.com"
+  retryConfig:
+    retryCount: 1                    # ✅ Zmniejszono z 2 na 1
+    maxRetryDuration: "30s"          # ✅ Zmniejszono z 60s na 30s
+    minBackoffDuration: "10s"        # ✅ Zwiększono z 5s na 10s
+    maxBackoffDuration: "30s"        # ✅ Zwiększono z 15s na 30s
+  attemptDeadline: "60s"             # ✅ Zwiększono z 30s na 60s
+
+---
+
+# 2. WORKER FAILSAFE JOB - Nocne wybudzenie i kontrola (raz dziennie)
+# Wywołuje pełną Cloud Run Service jako zabezpieczenie
+apiVersion: cloudscheduler.googleapis.com/v1
+kind: Job
+metadata:
+  name: tesla-worker-daily-check
+  project: YOUR_PROJECT_ID
+spec:
+  schedule: "0 0 * * *"  # Codziennie o 00:00 czasu warszawskiego (północ)
+  timeZone: "Europe/Warsaw"
+  description: "Tesla Worker - dzienny failsafe i nocne wybudzenie (koszt: ~kilka groszy)"
+  httpTarget:
+    uri: "YOUR_WORKER_SERVICE_URL/run-midnight-wake"
+    httpMethod: POST
+    headers:
+      Content-Type: "application/json"
+      User-Agent: "Google-Cloud-Scheduler"
+    body: |
+      {
+        "trigger": "cloud_scheduler_worker_failsafe",
+        "action": "midnight_wake_and_check",
+        "time": "00:00_Warsaw",
+        "force_full_check": true
+      }
+    oidcToken:
+      serviceAccountEmail: "YOUR_PROJECT_ID@appspot.gserviceaccount.com"
+  retryConfig:
+    retryCount: 3
+    maxRetryDuration: "300s"
+    minBackoffDuration: "10s"
+    maxBackoffDuration: "60s"
+  attemptDeadline: "120s"
+
+---
+
+# 3. WORKER EMERGENCY JOB - Awaryjne wywołanie Worker (opcjonalne)
+# Można użyć do manualnego wywołania pełnej logiki
+apiVersion: cloudscheduler.googleapis.com/v1
+kind: Job
+metadata:
+  name: tesla-worker-emergency
+  project: YOUR_PROJECT_ID
+spec:
+  schedule: "0 12 * * 0"  # Niedziela 12:00 czasu warszawskiego (rzadko, jako test)
+  timeZone: "Europe/Warsaw"
+  description: "Tesla Worker - awaryjne wywołanie pełnej logiki (test tygodniowy)"
+  httpTarget:
+    uri: "YOUR_WORKER_SERVICE_URL/run-cycle"
+    httpMethod: POST
+    headers:
+      Content-Type: "application/json"
+      User-Agent: "Google-Cloud-Scheduler"
+    body: |
+      {
+        "trigger": "cloud_scheduler_worker_emergency",
+        "action": "full_check",
+        "time": "12:00_Warsaw_Sunday",
+        "force_full_check": true,
+        "reason": "weekly_emergency_test"
+      }
+    oidcToken:
+      serviceAccountEmail: "YOUR_PROJECT_ID@appspot.gserviceaccount.com"
+  retryConfig:
+    retryCount: 2
+    maxRetryDuration: "180s"
+    minBackoffDuration: "10s"
+    maxBackoffDuration: "30s"
+  attemptDeadline: "90s"
+
+---
+
+# PODSUMOWANIE ARCHITEKTURY "SCOUT & WORKER":
+#
+# SCOUT (Cloud Function):
+# - Częstotliwość: Co 15 minut (96 razy dziennie)
+# - Zadanie: Tylko sprawdza lokalizację pojazdu
+# - Koszt: ~0.01 groszy za wywołanie = ~1 grosz dziennie
+# - Wywołuje Worker tylko gdy pojazd wraca do domu
+#
+# WORKER (Cloud Run Service):
+# - Częstotliwość: 2-3 razy dziennie + 1x failsafe = ~4 razy dziennie
+# - Zadanie: Pełna logika, OFF PEAK CHARGE API, Tesla HTTP Proxy
+# - Koszt: ~kilka groszy za wywołanie = ~20 groszy dziennie
+#
+# ŁĄCZNY KOSZT DZIENNY: ~20 groszy (vs obecne 6 zł)
+# OSZCZĘDNOŚĆ: ~96% redukcja kosztów 

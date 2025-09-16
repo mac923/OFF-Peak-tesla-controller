@@ -1,0 +1,62 @@
+# Cloud Scheduler Job dla Special Charging Daily Check
+# Sprawdza Google Sheets dla wyjątkowych potrzeb ładowania
+# Wykonywany codziennie o 00:01 czasu warszawskiego
+
+apiVersion: cloudscheduler.googleapis.com/v1
+kind: Job
+metadata:
+  name: tesla-special-charging-daily-check
+  project: YOUR_PROJECT_ID
+spec:
+  schedule: "1 0 * * *"  # Codziennie o 00:01 czasu warszawskiego
+  timeZone: "Europe/Warsaw"
+  description: "Tesla Special Charging - daily check Google Sheets i planowanie harmonogramów"
+  httpTarget:
+    uri: "YOUR_WORKER_SERVICE_URL/daily-special-charging-check"
+    httpMethod: POST
+    headers:
+      Content-Type: "application/json"
+      User-Agent: "Google-Cloud-Scheduler"
+    body: |
+      {
+        "trigger": "cloud_scheduler_special_charging",
+        "action": "daily_special_charging_check",
+        "time": "00:01_Warsaw",
+        "check_type": "daily_sheets_scan"
+      }
+    oidcToken:
+      serviceAccountEmail: "YOUR_PROJECT_ID@appspot.gserviceaccount.com"
+  retryConfig:
+    retryCount: 2
+    maxRetryDuration: "180s"
+    minBackoffDuration: "15s"
+    maxBackoffDuration: "60s"
+  attemptDeadline: "120s"
+
+---
+
+# UWAGI DLA UŻYTKOWNIKA:
+#
+# 1. ZASTĄP PLACEHOLDERY:
+#    - YOUR_PROJECT_ID: Twój Google Cloud Project ID
+#    - YOUR_WORKER_SERVICE_URL: URL Twojego Worker Service
+#
+# 2. HARMONOGRAM:
+#    - Wykonywany codziennie o 00:01 czasu warszawskiego
+#    - Sprawdza Google Sheets dla potrzeb na najbliższe 48h
+#    - Planuje harmonogramy ładowania na odpowiedni czas
+#
+# 3. KONFIGURACJA GOOGLE SHEETS:
+#    - Wymagane zmienne środowiskowe w Worker Service:
+#      * GOOGLE_SHEETS_URL - Link do arkusza Google Sheets
+#      * GOOGLE_SERVICE_ACCOUNT_KEY - JSON key dla service account
+#
+# 4. WDROŻENIE:
+#    gcloud scheduler jobs create http tesla-special-charging-daily-check \
+#      --schedule="1 0 * * *" \
+#      --time-zone="Europe/Warsaw" \
+#      --uri="YOUR_WORKER_SERVICE_URL/daily-special-charging-check" \
+#      --http-method=POST \
+#      --headers="Content-Type=application/json" \
+#      --message-body='{"trigger":"cloud_scheduler_special_charging","action":"daily_special_charging_check"}' \
+#      --oidc-service-account-email="YOUR_PROJECT_ID@appspot.gserviceaccount.com" 

@@ -1,0 +1,75 @@
+# Dockerfile dla Tesla Worker Service
+# Część architektury "Scout & Worker" dla agresywnej optymalizacji kosztów
+# 
+# Worker Service: Ciężka usługa uruchamiana on-demand przez Scout Function
+# - Pełna logika Tesla Monitor z Tesla HTTP Proxy
+# - Uruchamiana 2-3x dziennie gdy pojazd wraca do domu
+# - Skaluje do zera między wywołaniami
+
+# === STAGE 1: Build Tesla HTTP Proxy ===
+FROM golang:1.23-alpine AS proxy-builder
+
+# Zainstaluj git i inne narzędzia
+RUN apk add --no-cache git ca-certificates
+
+# Pobierz i zbuduj Tesla HTTP Proxy
+RUN git clone https://github.com/teslamotors/vehicle-command.git /tmp/vehicle-command
+WORKDIR /tmp/vehicle-command
+
+# Zbuduj proxy
+RUN go mod tidy && \
+    CGO_ENABLED=0 GOOS=linux go build -o tesla-http-proxy ./cmd/tesla-http-proxy
+
+# === STAGE 2: Python Application ===
+FROM python:3.11-slim
+
+# Metadane
+LABEL maintainer="Tesla Monitor Scout & Worker Architecture"
+LABEL description="Worker Service - Heavy Tesla logic with proxy"
+LABEL architecture="scout-worker-optimized"
+LABEL cost-tier="expensive-rare"
+
+# Zainstaluj wymagane pakiety systemowe
+RUN apt-get update && apt-get install -y \
+    curl \
+    openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Utwórz katalog aplikacji
+WORKDIR /app
+
+# Skopiuj Tesla HTTP Proxy z builder stage
+COPY --from=proxy-builder /tmp/vehicle-command/tesla-http-proxy /usr/local/bin/tesla-http-proxy
+RUN chmod +x /usr/local/bin/tesla-http-proxy
+
+# Skopiuj wymagania i zainstaluj zależności
+COPY requirements_cloud.txt .
+RUN pip install --no-cache-dir -r requirements_cloud.txt
+
+# Skopiuj kod aplikacji
+COPY cloud_tesla_monitor.py .
+COPY cloud_tesla_worker.py .
+COPY tesla_controller.py .
+COPY tesla_fleet_api_client.py .
+
+# Skopiuj startup script
+COPY startup_worker.sh .
+RUN chmod +x startup_worker.sh
+
+# Ustaw zmienne środowiskowe dla Worker Service
+ENV TESLA_WORKER_MODE=true
+ENV CONTINUOUS_MODE=false
+ENV TESLA_SMART_PROXY_MODE=true
+ENV TESLA_PROXY_AVAILABLE=true
+ENV TESLA_HTTP_PROXY_HOST=localhost
+ENV TESLA_HTTP_PROXY_PORT=4443
+
+# Port aplikacji
+EXPOSE 8080
+
+# Healthcheck dla Worker Service
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Uruchom Worker Service
+CMD ["./startup_worker.sh"] 

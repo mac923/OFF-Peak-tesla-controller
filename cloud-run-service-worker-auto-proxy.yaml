@@ -1,0 +1,146 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: tesla-worker
+spec:
+  template:
+    metadata:
+      annotations:
+        # KLUCZOWE: Skalowanie do zera dla maksymalnej optymalizacji kosztów
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "1"
+        # Szybki cold start
+        run.googleapis.com/execution-environment: gen2
+        run.googleapis.com/cpu-throttling: "false"
+        # Dłuższy timeout dla operacji z Tesla HTTP Proxy
+        run.googleapis.com/timeout: "600"
+    spec:
+      # Timeout dla całego kontenera
+      timeoutSeconds: 600
+      containerConcurrency: 1
+      containers:
+      - name: tesla-worker
+        image: gcr.io/off-peak-tesla-controller/tesla-worker:1754509539
+        ports:
+        - containerPort: 8080
+        env:
+        # KLUCZOWE: Worker mode
+        - name: TESLA_WORKER_MODE
+          value: "true"
+        - name: CONTINUOUS_MODE
+          value: "false"
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "off-peak-tesla-controller"
+        - name: GOOGLE_CLOUD_STORAGE_BUCKET
+          value: "tesla-monitor-data-off-peak-tesla-controller"
+        
+        # Tesla API Configuration
+        - name: TESLA_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: tesla-client-id
+              key: latest
+        - name: TESLA_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: tesla-client-secret
+              key: latest
+        - name: TESLA_REFRESH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: tesla-refresh-token
+              key: latest
+        
+        # Tesla HTTP Proxy Configuration (Smart Proxy Mode)
+        - name: TESLA_SMART_PROXY_MODE
+          value: "true"
+        - name: TESLA_PROXY_AVAILABLE
+          value: "true"
+        - name: TESLA_HTTP_PROXY_HOST
+          value: "localhost"
+        - name: TESLA_HTTP_PROXY_PORT
+          value: "4443"
+        
+        # Home Location
+        - name: HOME_LATITUDE
+          value: "52.334215"
+        - name: HOME_LONGITUDE
+          value: "20.937516"
+        - name: HOME_RADIUS
+          value: "0.001"
+        
+        # OFF PEAK CHARGE API
+        - name: OFF_PEAK_CHARGE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: OFF_PEAK_CHARGE_API_KEY
+              key: latest
+        
+        # Special Charging - Google Sheets Integration
+        - name: GOOGLE_SHEETS_URL
+          valueFrom:
+            secretKeyRef:
+              name: GOOGLE_SHEETS_URL
+              key: latest
+        - name: GOOGLE_SERVICE_ACCOUNT_KEY
+          valueFrom:
+            secretKeyRef:
+              name: GOOGLE_SERVICE_ACCOUNT_KEY
+              key: latest
+        
+        resources:
+          # WORKER: Więcej zasobów dla pełnej logiki z proxy
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+        
+        # Health check - Worker Service
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 3
+
+        # Startup probe dla cold start z proxy
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 0
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 18  # 180 sekund na startup z proxy
+
+---
+
+# PODSUMOWANIE WORKER SERVICE:
+#
+# ZADANIE:
+# - Pełna logika Tesla Monitor z Tesla HTTP Proxy
+# - Wywołania OFF PEAK CHARGE API
+# - Zarządzanie harmonogramami ładowania
+#
+# CZĘSTOTLIWOŚĆ:
+# - 2-3 razy dziennie gdy Scout wykryje powrót do domu
+# - 1 raz dziennie jako failsafe (nocne wybudzenie)
+# - Łącznie: ~4 wywołania dziennie
+#
+# KOSZT:
+# - ~5-10 groszy za wywołanie
+# - Łączny koszt dzienny: ~20-40 groszy
+# - Oszczędność vs obecna wersja: ~95%
+#
+# ENDPOINTS:
+# - GET /health - Health check
+# - GET /worker-status - Szczegółowy status Worker
+# - POST /run-cycle - Pełny cykl monitorowania
+# - POST /run-midnight-wake - Nocne wybudzenie
+# - POST /scout-trigger - Wywołanie od Scout Function
+# - GET /reset - Reset stanu
+# - GET /reset-tesla-schedules - Reset harmonogramów 

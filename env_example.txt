@@ -1,0 +1,39 @@
+# Tesla Account Configuration
+TESLA_EMAIL=your_tesla_email@example.com
+
+# Tesla Fleet API Configuration
+# Skopiuj ten plik jako .env i wypełnij własnymi wartościami
+
+# Tesla Fleet API - WYMAGANE
+# Otrzymasz te wartości po zarejestrowaniu aplikacji w Tesla Developer Portal
+TESLA_CLIENT_ID=your_client_id_from_tesla_developer_portal
+TESLA_CLIENT_SECRET=your_client_secret_from_tesla_developer_portal
+TESLA_DOMAIN=your-domain.com
+TESLA_PRIVATE_KEY_FILE=private-key.pem
+TESLA_PUBLIC_KEY_URL=https://your-domain.com/.well-known/appspecific/com.tesla.3p.public-key.pem
+
+# Tesla HTTP Proxy - OPCJONALNE
+# Ustaw jeśli używasz lokalnego tesla-http-proxy
+TESLA_HTTP_PROXY_HOST=localhost
+TESLA_HTTP_PROXY_PORT=4443
+
+# Inne ustawienia - OPCJONALNE
+TESLA_TIMEOUT=30
+
+# Uwagi:
+# 1. Nie commituj pliku .env do repozytorium!
+# 2. Klucz prywatny (private-key.pem) musi być w katalogu głównym
+# 3. Klucz publiczny musi być dostępny pod podanym URL
+# 4. Zobacz FLEET_API_SETUP.md dla szczegółowych instrukcji
+
+# Opcjonalne ustawienia
+TESLA_CACHE_FILE=tesla_cache.json
+
+HOME_LATITUDE=
+HOME_LONGITUDE=
+HOME_RADIUS=
+
+# OFF PEAK CHARGE API - używa Google Cloud Secret Manager
+# Sekrety do utworzenia w Google Cloud:
+# - OFF_PEAK_CHARGE_API_URL (opcjonalny)
+# - OFF_PEAK_CHARGE_API_KEY (wymagany)

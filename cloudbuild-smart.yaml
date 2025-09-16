@@ -1,0 +1,8 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-f', 'Dockerfile.smart', '-t', 'gcr.io/$PROJECT_ID/tesla-monitor:smart', '.']
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push', 'gcr.io/$PROJECT_ID/tesla-monitor:smart']
+
+images:
+- 'gcr.io/$PROJECT_ID/tesla-monitor:smart' 
