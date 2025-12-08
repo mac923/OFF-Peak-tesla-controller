@@ -235,43 +235,62 @@ class TeslaFleetAPIClient:
             return False
     
     def _save_tokens(self):
-        """Zapisuje tokeny do pliku i Secret Manager (Google Cloud)"""
+        """
+        Zapisuje tokeny zgodnie z wymaganiami Tesla API.
+
+        OPTYMALIZACJA KOSZTÓW: Do Secret Manager zapisujemy TYLKO gdy refresh_token
+        się zmieni (Tesla może go rotować przy każdym odświeżeniu).
+
+        Zgodne z dokumentacją Tesla:
+        - "ensure the new refresh token is saved for use on the next exchange"
+        - Refresh token jest single-use, ale poprzedni działa jeszcze 24h (fallback)
+        """
         token_data = {
             'access_token': self.access_token,
             'refresh_token': self.refresh_token,
             'expires_at': self.token_expires_at.isoformat() if self.token_expires_at else None,
-            'refresh_token_created_at': datetime.now(timezone.utc).isoformat()  # NAPRAWKA: używaj timezone-aware
+            'refresh_token_created_at': datetime.now(timezone.utc).isoformat()
         }
-        
-        # Zapisz lokalnie
+
+        # Sprawdź czy refresh_token się zmienił (Tesla może go rotować)
+        refresh_token_changed = (
+            not hasattr(self, '_last_saved_refresh_token') or
+            self._last_saved_refresh_token != self.refresh_token
+        )
+
+        # Zapisz lokalnie (zawsze - szybkie i darmowe)
         try:
             with open('fleet_tokens.json', 'w') as f:
                 json.dump(token_data, f)
             console.print("[green]✓ Tokeny zapisane lokalnie[/green]")
         except Exception as e:
             console.print(f"[yellow]⚠️ Nie udało się zapisać tokenów lokalnie: {e}[/yellow]")
-        
-        # Zapisz w Google Cloud Secret Manager jeśli dostępne
+
+        # Zapisz w Google Cloud Secret Manager TYLKO gdy refresh_token się zmienił
+        # (optymalizacja kosztów - unikamy tworzenia nowych wersji bez potrzeby)
         project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
-        if project_id:
+        if project_id and refresh_token_changed:
             try:
                 from google.cloud import secretmanager
                 client = secretmanager.SecretManagerServiceClient()
-                
+
                 # Utwórz nową wersję sekretu
                 secret_name = f"projects/{project_id}/secrets/fleet-tokens"
                 payload = json.dumps(token_data).encode("UTF-8")
-                
+
                 response = client.add_secret_version(
                     request={
                         "parent": secret_name,
                         "payload": {"data": payload}
                     }
                 )
-                console.print("[green]✓ Tokeny zaktualizowane w Google Cloud Secret Manager[/green]")
-                
+                self._last_saved_refresh_token = self.refresh_token
+                console.print("[green]🔐 Nowy refresh token zapisany do Secret Manager[/green]")
+
             except Exception as e:
                 console.print(f"[yellow]⚠️ Nie udało się zaktualizować tokenów w Secret Manager: {e}[/yellow]")
+        elif project_id:
+            console.print("[dim]ℹ️ Refresh token bez zmian - pomijam zapis do Secret Manager (oszczędność kosztów)[/dim]")
     
     def _clear_tokens(self):
         """Czyści tokeny z pamięci i pliku"""
@@ -333,7 +352,10 @@ class TeslaFleetAPIClient:
             
             self.access_token = token_data.get('access_token')
             self.refresh_token = token_data.get('refresh_token')
-            
+
+            # Zapamiętaj aktualny refresh_token do wykrywania zmian (optymalizacja kosztów)
+            self._last_saved_refresh_token = self.refresh_token
+
             if token_data.get('expires_at'):
                 expires_str = token_data['expires_at']
                 # NAPRAWKA: Zapewnij timezone-aware datetime dla porównań
@@ -344,7 +366,7 @@ class TeslaFleetAPIClient:
                     self.token_expires_at = self.token_expires_at.replace(tzinfo=timezone.utc)
 
             return True
-            
+
         except Exception as e:
             console.print(f"[yellow]⚠️ Nie udało się załadować tokenów z fleet-tokens: {e}[/yellow]")
             return False
@@ -357,7 +379,10 @@ class TeslaFleetAPIClient:
             
             self.access_token = token_data.get('access_token')
             self.refresh_token = token_data.get('refresh_token')
-            
+
+            # Zapamiętaj aktualny refresh_token do wykrywania zmian (optymalizacja kosztów)
+            self._last_saved_refresh_token = self.refresh_token
+
             if token_data.get('expires_at'):
                 expires_str = token_data['expires_at']
                 # NAPRAWKA: Zapewnij timezone-aware datetime dla porównań
@@ -366,7 +391,7 @@ class TeslaFleetAPIClient:
                 self.token_expires_at = datetime.fromisoformat(expires_str)
                 if self.token_expires_at.tzinfo is None:
                     self.token_expires_at = self.token_expires_at.replace(tzinfo=timezone.utc)
-            
+
             console.print("[green]✓ Tokeny załadowane z lokalnego pliku[/green]")
             return True
         except FileNotFoundError:
