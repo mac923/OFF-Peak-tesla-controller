@@ -656,16 +656,16 @@ class CloudTeslaMonitor:
                 logger.warning("⚠️ Brak konfiguracji Google Cloud Project - nie można pobrać sekretów OFF PEAK CHARGE API")
                 return _create_fallback_response("brak konfiguracji Google Cloud")
             
-            # Pobierz URL API z sekretu (z fallback'iem na domyślną wartość)
-            api_url = get_secret('OFF_PEAK_CHARGE_API_URL', self.project_id)
+            # OPTYMALIZACJA: Pobierz URL i klucz API z ENV (zamiast Secret Manager API)
+            # Sekrety są zaciągane jako ENV w cloud-run-service-worker.yaml
+            api_url = os.getenv('OFF_PEAK_CHARGE_API_URL')
             if not api_url:
                 api_url = 'http://localhost:3000/api/external-calculate'
                 logger.info(f"⚠️ Używam domyślnego URL OFF PEAK CHARGE API: {api_url}")
-            
-            # Pobierz klucz API z sekretu
-            api_key = get_secret('OFF_PEAK_CHARGE_API_KEY', self.project_id)
+
+            api_key = os.getenv('OFF_PEAK_CHARGE_API_KEY')
             if not api_key:
-                logger.warning("⚠️ Brak sekretu 'OFF_PEAK_CHARGE_API_KEY' w Google Cloud")
+                logger.warning("⚠️ Brak zmiennej środowiskowej 'OFF_PEAK_CHARGE_API_KEY'")
                 return _create_fallback_response("brak klucza API")
             
             # Przygotuj dane żądania zgodnie z dokumentacją
@@ -2093,7 +2093,28 @@ class CloudTeslaMonitor:
             logger.info(f"📋 Harmonogram dla {vehicle_vin[-4:]}: IDENTYCZNY (hash: {new_hash[:8]}...)")
         
         return is_different
-    
+
+    def _is_schedule_for_today(self, start_warsaw: datetime, end_warsaw: datetime) -> bool:
+        """
+        Sprawdza czy harmonogram dotyczy dzisiejszego dnia kalendarzowego.
+        Midnight wake o 00:00 zapewnia że po północy zostanie wykonane
+        świeże wywołanie API z harmonogramami na nowy dzień.
+        """
+        now_warsaw = self._get_warsaw_time()
+        today = now_warsaw.date()
+        start_date = start_warsaw.date()
+
+        # Przypadek 1: Harmonogram zaczyna się dzisiaj
+        if start_date == today:
+            return True
+
+        # Przypadek 2: Harmonogram aktywny (zaczął się wczoraj, wciąż trwa)
+        yesterday = today - timedelta(days=1)
+        if start_date == yesterday and now_warsaw < end_warsaw:
+            return True
+
+        return False
+
     def _convert_off_peak_to_tesla_schedules(self, off_peak_data: Dict[str, Any], vehicle_vin: str) -> List[ChargeSchedule]:
         """
         Konwertuje harmonogram z API OFF PEAK CHARGE do formatu Tesla ChargeSchedule
@@ -2128,7 +2149,8 @@ class CloudTeslaMonitor:
                 # Fallback do domyślnych wartości
                 home_lat = float(os.getenv('HOME_LATITUDE', '52.334215'))
                 home_lon = float(os.getenv('HOME_LONGITUDE', '20.937516'))
-            
+
+            filtered_count = 0
             for i, slot in enumerate(charging_schedule):
                 # Parsuj czasy z formatu ISO 8601
                 start_time_str = slot.get('start_time', '')
@@ -2146,7 +2168,14 @@ class CloudTeslaMonitor:
                     warsaw_tz = pytz.timezone('Europe/Warsaw')
                     start_warsaw = start_dt.astimezone(warsaw_tz)
                     end_warsaw = end_dt.astimezone(warsaw_tz)
-                    
+
+                    # Filtrowanie: przepuszczaj tylko harmonogramy na dzisiejszy dzień
+                    if not self._is_schedule_for_today(start_warsaw, end_warsaw):
+                        logger.info(f"🔜 Harmonogram #{i+1}: {start_warsaw.strftime('%Y-%m-%d %H:%M')}-"
+                                   f"{end_warsaw.strftime('%Y-%m-%d %H:%M')} - POMINIĘTY (nie dotyczy dzisiaj)")
+                        filtered_count += 1
+                        continue
+
                     # Oblicz minuty od północy
                     start_minutes = start_warsaw.hour * 60 + start_warsaw.minute
                     end_minutes = end_warsaw.hour * 60 + end_warsaw.minute
@@ -2206,7 +2235,9 @@ class CloudTeslaMonitor:
             )
             
             if is_empty_schedule:
-                logger.warning("⚠️  API OFF PEAK CHARGE zwróciło pusty harmonogram - tworzę fallback slot")
+                if filtered_count > 0:
+                    logger.info(f"⚠️ Wszystkie {filtered_count} harmonogramów z OFF PEAK API dotyczą przyszłych dni")
+                logger.warning("⚠️ Brak harmonogramów na dzisiaj - tworzę fallback slot 23:59-00:00")
                 
                 # Ustaw stały harmonogram fallback: 23:59-00:00 (1 minuta ładowania)
                 start_minutes = 23 * 60 + 59  # 23:59 = 1439 minut od północy
@@ -2232,7 +2263,9 @@ class CloudTeslaMonitor:
                 logger.info(f"   📍 Minuty: {start_minutes}-{end_minutes}")
                 logger.info(f"   ⏰ Harmonogram fallback - minimalny slot przed północą")
             
-            logger.info(f"✅ Skonwertowano {len(schedules)} harmonogramów z API OFF PEAK CHARGE")
+            if filtered_count > 0:
+                logger.info(f"🔜 Pominięto {filtered_count} harmonogramów (dotyczą przyszłych dni)")
+            logger.info(f"✅ Skonwertowano {len(schedules)} harmonogramów z API OFF PEAK CHARGE (dla dzisiaj)")
             return schedules
             
         except Exception as e:
