@@ -440,10 +440,9 @@ class TeslaController:
         cached_state = self.current_vehicle.get('state', 'unknown')
         console.print(f"[yellow]🔍 Stan pojazdu w cache: {cached_state}[/yellow]")
 
-        # Sprawdzenie czy pojazd jest już online
-        if cached_state == 'online':
-            console.print(f"[green]✓ Pojazd online (cache) - pomijam wake_up[/green]")
-            return True
+        # UWAGA: Nie polegamy na cache - zawsze wywołujemy wake_up
+        # Cache może być nieaktualny (pojazd zasnął od ostatniego sprawdzenia)
+        # wake_up jest idempotentne - jeśli pojazd już nie śpi, natychmiast zwraca sukces
 
         try:
             proxy_info = "przez proxy" if use_proxy else "przez Fleet API"
