@@ -436,15 +436,24 @@ class TeslaController:
             console.print("[red]Nie można pobrać ID pojazdu.[/red]")
             return False
         
+        # LOG DIAGNOSTYCZNY: Stan pojazdu w cache
+        cached_state = self.current_vehicle.get('state', 'unknown')
+        console.print(f"[yellow]🔍 Stan pojazdu w cache: {cached_state}[/yellow]")
+
         # Sprawdzenie czy pojazd jest już online
-        if self.current_vehicle.get('state') == 'online':
+        if cached_state == 'online':
+            console.print(f"[green]✓ Pojazd online (cache) - pomijam wake_up[/green]")
             return True
-        
+
         try:
+            proxy_info = "przez proxy" if use_proxy else "przez Fleet API"
+            console.print(f"[yellow]🔄 Budzenie pojazdu {proxy_info}...[/yellow]")
+
             success = self.fleet_api.wake_vehicle(vehicle_id, use_proxy=use_proxy)
             if success:
+                console.print(f"[yellow]⏳ Oczekiwanie na obudzenie pojazdu (max 30s)...[/yellow]")
                 # Czekanie na obudzenie pojazdu
-                for _ in range(30):  # Maksymalnie 30 sekund
+                for i in range(30):  # Maksymalnie 30 sekund
                     time.sleep(1)
                     # Odświeżenie danych pojazdu
                     vehicles = self.fleet_api.get_vehicles()
@@ -452,13 +461,17 @@ class TeslaController:
                         if vehicle.get('vin') == self.current_vehicle.get('vin'):
                             self.current_vehicle = vehicle
                             break
-                    
+
                     if self.current_vehicle.get('state') == 'online':
+                        console.print(f"[green]✅ Pojazd obudzony po {i+1}s[/green]")
                         break
-            
+            else:
+                console.print(f"[red]❌ Komenda wake_up nie powiodła się[/red]")
+
             if self.current_vehicle.get('state') == 'online':
                 return True
             else:
+                console.print(f"[red]⏰ Timeout wake_up - pojazd nie odpowiedział w 30s[/red]")
                 return False
             
         except Exception as e:
@@ -823,25 +836,26 @@ class TeslaController:
             return False
         
         try:
-            if not self.wake_up_vehicle():
+            # Sprawdź czy proxy jest dostępny
+            use_proxy = bool(hasattr(self.fleet_api, 'proxy_url') and self.fleet_api.proxy_url)
+
+            if not self.wake_up_vehicle(use_proxy=use_proxy):
                 return False
-            
+
             console.print(f"[yellow]Ustawianie prądu ładowania na {amps}A...[/yellow]")
             result = self.fleet_api.set_charging_amps(vehicle_id, amps)
-            
+
             if result:
                 console.print(f"[green]Prąd ładowania ustawiony na {amps}A (Fleet API).[/green]")
                 return True
             else:
                 console.print(f"[red]Błąd podczas ustawiania prądu ładowania.[/red]")
                 return False
-                
+
         except Exception as e:
             console.print(f"[red]Błąd podczas ustawiania prądu ładowania: {e}[/red]")
             return False
-    
 
-    
     def time_to_minutes(self, time_str: str) -> int:
         """
         Konwertuje czas w formacie HH:MM na minuty od północy
@@ -927,21 +941,23 @@ class TeslaController:
             return False
         
         try:
-            if not self.wake_up_vehicle():
+            # Sprawdź czy proxy jest dostępny (używamy dla wake_up i komendy)
+            use_proxy = bool(hasattr(self.fleet_api, 'proxy_url') and self.fleet_api.proxy_url)
+
+            # Wybudź pojazd z tym samym ustawieniem proxy co komenda
+            if not self.wake_up_vehicle(use_proxy=use_proxy):
                 return False
-            
+
             # Ustaw lokalizację jeśli nie została podana
             if schedule.lat == 0.0 and schedule.lon == 0.0:
                 schedule.lat, schedule.lon = self.get_vehicle_location()
                 console.print(f"[blue]Ustawiono lokalizację harmonogramu: {schedule.lat:.6f}, {schedule.lon:.6f}[/blue]")
-            
-            # Sprawdź czy proxy jest dostępny
-            if hasattr(self.fleet_api, 'proxy_url') and self.fleet_api.proxy_url:
+
+            # Log informacyjny
+            if use_proxy:
                 console.print("[yellow]Dodawanie harmonogramu ładowania przez Tesla HTTP Proxy...[/yellow]")
-                use_proxy = True
             else:
                 console.print("[yellow]Dodawanie harmonogramu ładowania przez Fleet API (brak proxy)...[/yellow]")
-                use_proxy = False
             
             # Wywołanie Fleet API
             result = self.fleet_api.add_charge_schedule(
@@ -990,11 +1006,14 @@ class TeslaController:
             return False
         
         try:
-            if not self.wake_up_vehicle():
+            # Sprawdź czy proxy jest dostępny
+            use_proxy = bool(hasattr(self.fleet_api, 'proxy_url') and self.fleet_api.proxy_url)
+
+            if not self.wake_up_vehicle(use_proxy=use_proxy):
                 return False
-            
+
             time_minutes = self.time_to_minutes(time_str)
-            
+
             console.print(f"[yellow]Ustawianie zaplanowanego ładowania na {time_str}...[/yellow]")
             result = self.fleet_api.set_scheduled_charging(vehicle_id, enable, time_minutes)
             
@@ -1029,17 +1048,20 @@ class TeslaController:
             return []
         
         try:
-            if not self.wake_up_vehicle():
+            # Sprawdź czy proxy jest dostępny
+            use_proxy = bool(hasattr(self.fleet_api, 'proxy_url') and self.fleet_api.proxy_url)
+
+            if not self.wake_up_vehicle(use_proxy=use_proxy):
                 return []
-            
+
             console.print("[yellow]Pobieranie harmonogramów ładowania...[/yellow]")
             schedules = self.fleet_api.get_charge_schedules(vehicle_id)
             return schedules
-            
+
         except Exception as e:
             console.print(f"[red]Błąd podczas pobierania harmonogramów: {e}[/red]")
             return []
-    
+
     def days_of_week_to_string(self, days_of_week: int) -> str:
         """
         Konwertuje days_of_week z formatu bitowego na czytelny string
@@ -1128,9 +1150,10 @@ class TeslaController:
             return False
         
         try:
-            if not self.wake_up_vehicle():
+            # Komenda wymaga proxy - użyj go też dla wake_up
+            if not self.wake_up_vehicle(use_proxy=True):
                 return False
-            
+
             # WAŻNE: Komendy modyfikujące harmonogram wymagają użycia proxy
             console.print(f"[yellow]Usuwanie harmonogramu ładowania (ID: {schedule_id}) przez Tesla HTTP Proxy...[/yellow]")
             result = self.fleet_api.remove_charge_schedule(vehicle_id, schedule_id, use_proxy=True)
@@ -1163,9 +1186,10 @@ class TeslaController:
             return False
         
         try:
-            if not self.wake_up_vehicle():
+            # Komenda wymaga proxy - użyj go też dla wake_up
+            if not self.wake_up_vehicle(use_proxy=True):
                 return False
-            
+
             # WAŻNE: Komendy modyfikujące harmonogram wymagają użycia proxy
             console.print("[yellow]Usuwanie wszystkich harmonogramów ładowania przez Tesla HTTP Proxy...[/yellow]")
             result = self.fleet_api.remove_all_charge_schedules(vehicle_id, use_proxy=True)
