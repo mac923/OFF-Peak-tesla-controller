@@ -86,7 +86,7 @@ gcloud scheduler jobs delete tesla-special-charging-cleanup --location=europe-we
 ### 3. **Test Complete System:**
 ```bash
 # Test daily check
-curl -X POST https://tesla-worker-74pl3bqokq-ew.a.run.app/daily-special-charging-check
+curl -X POST https://tesla-worker-1005200689027.europe-west1.run.app/daily-special-charging-check
 
 # Sprawdź dynamic jobs (powinny być 2: send + cleanup)  
 gcloud scheduler jobs list --location=europe-west1 | grep special-

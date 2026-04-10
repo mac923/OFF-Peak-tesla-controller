@@ -6,7 +6,7 @@
 ```
 INFO 2025-09-05T23:00:00.814678582Z special-charging-special_2_20250906_0700 scheduled at 23:00:00.807908Z
 WARNING 2025-09-05T23:00:01.826428Z [httpRequest.status: 403] [httpRequest.latency: 0 ms] 
-ERROR 2025-09-05T23:00:01.998830515Z "status":"PERMISSION_DENIED", "targetType":"HTTP", "url":"https://tesla-worker-74pl3bqokq-ew.a.run.app/send-special-schedule"
+ERROR 2025-09-05T23:00:01.998830515Z "status":"PERMISSION_DENIED", "targetType":"HTTP", "url":"https://tesla-worker-1005200689027.europe-west1.run.app/send-special-schedule"
 ```
 
 ### **Przyczyna:**

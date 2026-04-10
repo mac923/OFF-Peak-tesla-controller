@@ -14,7 +14,7 @@
 
 ### **Logi potwierdzające problem:**
 ```
-POST https://tesla-worker-74pl3bqokq-ew.a.run.app/run-cycle  ← Scout używa /run-cycle!
+POST https://tesla-worker-1005200689027.europe-west1.run.app/run-cycle  ← Scout używa /run-cycle!
 🔧 [WORKER] Uruchamianie cyklu monitorowania (trigger: scout_detected_change)
 [16:15] ❌ VIN=0971, bateria=0%, ładowanie=niegotowe, lokalizacja=UNKNOWN  ← Bez wybudzenia!
 ✅ [WORKER] Cykl monitorowania zakończony w 0.208s

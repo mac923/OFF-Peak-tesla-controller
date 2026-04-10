@@ -113,7 +113,7 @@ Rekomendowane dodanie:
 # Proactive Token Health Check
 - name: tesla-worker-proactive-token-check
   schedule: "0 */2 * * *"  # Co 2 godziny
-  url: "https://tesla-worker-74pl3bqokq-ew.a.run.app/proactive-token-check"
+  url: "https://tesla-worker-1005200689027.europe-west1.run.app/proactive-token-check"
   method: POST
   description: "Proaktywne sprawdzanie i odświeżanie tokenów Tesla (zapobieganie deadlock)"
 ```

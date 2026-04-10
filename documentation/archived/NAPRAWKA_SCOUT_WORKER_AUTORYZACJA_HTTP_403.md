@@ -169,7 +169,7 @@ WARNING 2025-09-05T07:01:13.557115Z The request was not authenticated.
 ### **Po naprawce:**
 ```
 INFO 2025-09-05T07:10:34.486652Z POST /refresh-tokens - Odśwież tokeny Tesla
-✅ [AUTH] Wygenerowano Identity Token dla: https://tesla-worker-74pl3bqokq-ew.a.run.app
+✅ [AUTH] Wygenerowano Identity Token dla: https://tesla-worker-1005200689027.europe-west1.run.app
 ✅ Scout Function działa poprawnie z autoryzacją
 ```
 

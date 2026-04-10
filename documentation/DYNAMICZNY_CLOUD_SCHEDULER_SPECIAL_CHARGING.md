@@ -124,7 +124,7 @@ env:
 - name: GOOGLE_CLOUD_LOCATION  
   value: "europe-west1"
 - name: WORKER_SERVICE_URL
-  value: "https://tesla-worker-74pl3bqokq-ew.a.run.app"
+  value: "https://tesla-worker-1005200689027.europe-west1.run.app"
 ```
 
 ### **2. Dependencies:**
@@ -197,7 +197,7 @@ gcloud scheduler jobs delete tesla-special-charging-cleanup --location=europe-we
 ### **KROK 3: Test**
 ```bash
 # Manual trigger daily check
-curl -X POST https://tesla-worker-74pl3bqokq-ew.a.run.app/daily-special-charging-check
+curl -X POST https://tesla-worker-1005200689027.europe-west1.run.app/daily-special-charging-check
 
 # Sprawdź logi
 gcloud logs read "resource.type=cloud_run_revision" --limit=50 | grep "\[SPECIAL\]"

@@ -186,7 +186,7 @@ Scout i Worker miały niezależne systemy zarządzania tokenami Tesla, powodują
 
 ### **Wdrożenie:**
 - **Scout Function:** https://tesla-scout-74pl3bqokq-ew.a.run.app (Cloud Function, co 15min)
-- **Worker Service:** https://tesla-worker-74pl3bqokq-ew.a.run.app (Cloud Run+Docker, on-demand)
+- **Worker Service:** https://tesla-worker-1005200689027.europe-west1.run.app (Cloud Run+Docker, on-demand)
 - **Cloud Scheduler:** 3 harmonogramy (Scout co 15min, Worker failsafe 00:00 UTC, emergency niedziela 12:00)
 
 ### **Korzyści:**

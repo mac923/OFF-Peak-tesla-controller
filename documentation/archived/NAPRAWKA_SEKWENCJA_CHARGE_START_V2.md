@@ -160,7 +160,7 @@ Rezultat: NAKŁADANIE WYKRYTE → charge_start przed harmonogramami
 **Środowisko:** Google Cloud (Scout & Worker Architecture)  
 **Endpoints:**
 - Scout Function: https://tesla-scout-74pl3bqokq-ew.a.run.app  
-- Worker Service: https://tesla-worker-74pl3bqokq-ew.a.run.app
+- Worker Service: https://tesla-worker-1005200689027.europe-west1.run.app
 
 **Status wdrożenia:** ✅ AKTYWNE od 2025-01-08
 
