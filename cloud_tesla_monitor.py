@@ -952,19 +952,26 @@ class CloudTeslaMonitor:
             logger.info(f"{time_str} 🚀 Uruchamianie Tesla HTTP Proxy on-demand...")
             if not self._start_proxy_on_demand():
                 logger.warning(f"{time_str} ⚠️ Tesla HTTP Proxy nie uruchomiony - próbuję usuwać przez Fleet API")
-            
+
+            # 5.5 OPTYMALIZACJA: Jeden wake_up przed całą sekwencją usuwania (unika HTTP 429)
+            logger.info(f"{time_str} 🔄 Budzenie pojazdu przed usunięciem {len(home_schedules)} harmonogramów...")
+            use_proxy = bool(hasattr(self.tesla_controller.fleet_api, 'proxy_url') and self.tesla_controller.fleet_api.proxy_url)
+            if not self.tesla_controller.wake_up_vehicle(use_proxy=use_proxy):
+                logger.warning(f"{time_str} ⚠️ Wake_up nie powiodło się - kontynuuję mimo to (pojazd może być już online)")
+
             # 6. Usuń wszystkie harmonogramy HOME jeden po drugim
             success_count = 0
             error_count = 0
             removed_schedule_ids = []
-            
+
             for schedule in home_schedules:
                 schedule_id = schedule.get('id')
                 if schedule_id:
                     logger.info(f"{time_str} 🗑️ Usuwanie harmonogramu HOME ID: {schedule_id}")
                     
                     try:
-                        if self.tesla_controller.remove_charge_schedule(schedule_id):
+                        # OPTYMALIZACJA: skip_wake=True bo wake_up już wywołane na początku sekwencji
+                        if self.tesla_controller.remove_charge_schedule(schedule_id, skip_wake=True):
                             success_count += 1
                             removed_schedule_ids.append(schedule_id)
                             logger.info(f"{time_str} ✅ Usunięto harmonogram ID: {schedule_id}")
@@ -2458,11 +2465,17 @@ class CloudTeslaMonitor:
         if not schedules:
             logger.info(f"📅 Brak harmonogramów do dodania dla {vehicle_vin[-4:]}")
             return True
-        
+
         try:
+            # OPTYMALIZACJA: Jeden wake_up na początku sekwencji zamiast przed każdą komendą
+            logger.info(f"🔄 Budzenie pojazdu przed dodaniem {len(schedules)} harmonogramów...")
+            use_proxy = bool(hasattr(self.tesla_controller.fleet_api, 'proxy_url') and self.tesla_controller.fleet_api.proxy_url)
+            if not self.tesla_controller.wake_up_vehicle(use_proxy=use_proxy):
+                logger.warning(f"⚠️ Wake_up nie powiodło się - kontynuuję mimo to (pojazd może być już online)")
+
             success_count = 0
             failed_schedules = []
-            
+
             for i, schedule in enumerate(schedules):
                 # NAPRAWKA: Dodaj opóźnienie między harmonogramami (Tesla API może nie nadążać)
                 if i > 0:
@@ -2473,8 +2486,9 @@ class CloudTeslaMonitor:
                 end_time = self.tesla_controller.minutes_to_time(schedule.end_time) if schedule.end_time else "N/A"
                 
                 logger.info(f"🔄 Dodawanie harmonogramu #{i+1}: {start_time}-{end_time}")
-                
-                if self.tesla_controller.add_charge_schedule(schedule):
+
+                # OPTYMALIZACJA: skip_wake=True bo wake_up już wywołane na początku sekwencji
+                if self.tesla_controller.add_charge_schedule(schedule, skip_wake=True):
                     success_count += 1
                     logger.info(f"✅ Dodano harmonogram #{i+1}: {start_time}-{end_time}")
                 else:
@@ -2815,7 +2829,13 @@ class CloudTeslaMonitor:
             if not home_schedules:
                 logger.info(f"📍 Brak harmonogramów HOME do wyłączenia dla {vehicle_vin[-4:]}")
                 return True
-            
+
+            # OPTYMALIZACJA: Jeden wake_up przed całą sekwencją wyłączania (unika HTTP 429)
+            logger.info(f"🔄 Budzenie pojazdu przed wyłączeniem {len(home_schedules)} harmonogramów...")
+            use_proxy = bool(hasattr(self.tesla_controller.fleet_api, 'proxy_url') and self.tesla_controller.fleet_api.proxy_url)
+            if not self.tesla_controller.wake_up_vehicle(use_proxy=use_proxy):
+                logger.warning(f"⚠️ Wake_up nie powiodło się - kontynuuję mimo to (pojazd może być już online)")
+
             success_count = 0
             for schedule in home_schedules:
                 schedule_id = schedule.get('id')
@@ -2835,7 +2855,8 @@ class CloudTeslaMonitor:
                             one_time=schedule.get('one_time', False)
                         )
                         
-                        if self.tesla_controller.add_charge_schedule(modified_schedule):
+                        # OPTYMALIZACJA: skip_wake=True bo wake_up już wywołane na początku sekwencji
+                        if self.tesla_controller.add_charge_schedule(modified_schedule, skip_wake=True):
                             success_count += 1
                             logger.info(f"🔕 Wyłączono harmonogram HOME ID: {schedule_id}")
                         else:
@@ -3178,11 +3199,17 @@ class CloudTeslaMonitor:
             if not old_schedules:
                 logger.info(f"📍 Brak harmonogramów do usunięcia dla {vehicle_vin[-4:]}")
                 return True
-            
+
+            # OPTYMALIZACJA: Jeden wake_up na początku sekwencji zamiast przed każdą komendą
+            logger.info(f"🔄 Budzenie pojazdu przed usunięciem {len(old_schedules)} harmonogramów...")
+            use_proxy = bool(hasattr(self.tesla_controller.fleet_api, 'proxy_url') and self.tesla_controller.fleet_api.proxy_url)
+            if not self.tesla_controller.wake_up_vehicle(use_proxy=use_proxy):
+                logger.warning(f"⚠️ Wake_up nie powiodło się - kontynuuję mimo to (pojazd może być już online)")
+
             # Usuń podane harmonogramy
             logger.info(f"🗑️ Usuwanie {len(old_schedules)} starych harmonogramów...")
             success_count = 0
-            
+
             for schedule in old_schedules:
                 schedule_id = schedule.get('id')
                 if schedule_id:
@@ -3195,7 +3222,8 @@ class CloudTeslaMonitor:
                     logger.info(f"📋 Stary harmonogram {schedule_id}: {start_time}-{end_time}, enabled={enabled}")
                     
                     try:
-                        if self.tesla_controller.remove_charge_schedule(schedule_id):
+                        # OPTYMALIZACJA: skip_wake=True bo wake_up już wywołane na początku sekwencji
+                        if self.tesla_controller.remove_charge_schedule(schedule_id, skip_wake=True):
                             success_count += 1
                             logger.info(f"✅ Usunięto stary harmonogram ID: {schedule_id}")
                         else:

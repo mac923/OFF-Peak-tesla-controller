@@ -1,0 +1,28 @@
+steps:
+# Krok 1: Build Docker image (--no-cache wymusza pobranie najnowszej wersji vehicle-command)
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '--no-cache', '-f', 'Dockerfile.worker', '-t', 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/tesla-worker:latest', '.']
+
+# Krok 2: Push image to Artifact Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push', 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/tesla-worker:latest']
+
+# Krok 3: Deploy using YAML config (lepsze zarządzanie zasobami)
+# Konfiguracja w cloud-run-service-worker.yaml
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  args:
+    - 'gcloud'
+    - 'run'
+    - 'services'
+    - 'replace'
+    - 'cloud-run-service-worker.yaml'
+    - '--region'
+    - 'europe-west1'
+
+timeout: '1200s'
+
+# OPTYMALIZACJA KOSZTÓW (2025-12):
+# - RAM: 2Gi -> 512Mi (faktyczne użycie ~80MB)
+# - CPU: 2 -> 1 (faktyczne użycie <0.5)
+# - Timeout: 600s -> 300s
+# - Special Charging zintegrowane z midnight wake

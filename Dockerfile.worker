@@ -12,7 +12,12 @@ FROM golang:1.23-alpine AS proxy-builder
 # Zainstaluj git i inne narzędzia
 RUN apk add --no-cache git ca-certificates
 
-# Pobierz i zbuduj Tesla HTTP Proxy
+# Cache bust - zmień tę datę aby wymusić pobranie najnowszej wersji vehicle-command
+# Tesla naprawiła issue #186 (HTTP 500 for sleeping vehicle) w styczniu 2025
+ARG VEHICLE_COMMAND_VERSION=2026-02-01
+RUN echo "Pobieranie vehicle-command (cache bust: ${VEHICLE_COMMAND_VERSION})"
+
+# Pobierz i zbuduj Tesla HTTP Proxy (najnowsza wersja z GitHub)
 RUN git clone https://github.com/teslamotors/vehicle-command.git /tmp/vehicle-command
 WORKDIR /tmp/vehicle-command
 

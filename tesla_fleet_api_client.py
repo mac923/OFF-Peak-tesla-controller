@@ -238,12 +238,7 @@ class TeslaFleetAPIClient:
         """
         Zapisuje tokeny zgodnie z wymaganiami Tesla API.
 
-        OPTYMALIZACJA KOSZTÓW: Do Secret Manager zapisujemy TYLKO gdy refresh_token
-        się zmieni (Tesla może go rotować przy każdym odświeżeniu).
-
-        Zgodne z dokumentacją Tesla:
-        - "ensure the new refresh token is saved for use on the next exchange"
-        - Refresh token jest single-use, ale poprzedni działa jeszcze 24h (fallback)
+        Auto-cleanup utrzymuje max 3 aktywne wersje w Secret Manager (kontrola kosztów).
         """
         token_data = {
             'access_token': self.access_token,
@@ -252,13 +247,13 @@ class TeslaFleetAPIClient:
             'refresh_token_created_at': datetime.now(timezone.utc).isoformat()
         }
 
-        # Sprawdź czy refresh_token się zmienił (Tesla może go rotować)
+        # Sprawdź czy refresh_token się zmienił (Tesla rotuje go przy każdym odświeżeniu)
         refresh_token_changed = (
             not hasattr(self, '_last_saved_refresh_token') or
             self._last_saved_refresh_token != self.refresh_token
         )
 
-        # Zapisz lokalnie (zawsze - szybkie i darmowe)
+        # Zapisz lokalnie (zawsze)
         try:
             with open('fleet_tokens.json', 'w') as f:
                 json.dump(token_data, f)
@@ -266,31 +261,61 @@ class TeslaFleetAPIClient:
         except Exception as e:
             console.print(f"[yellow]⚠️ Nie udało się zapisać tokenów lokalnie: {e}[/yellow]")
 
-        # Zapisz w Google Cloud Secret Manager TYLKO gdy refresh_token się zmienił
-        # (optymalizacja kosztów - unikamy tworzenia nowych wersji bez potrzeby)
+        # Zapisz do Secret Manager przy każdej zmianie refresh_token
+        # Auto-cleanup utrzymuje max 3 aktywne wersje (kontrola kosztów)
         project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
         if project_id and refresh_token_changed:
             try:
                 from google.cloud import secretmanager
                 client = secretmanager.SecretManagerServiceClient()
 
-                # Utwórz nową wersję sekretu
                 secret_name = f"projects/{project_id}/secrets/fleet-tokens"
                 payload = json.dumps(token_data).encode("UTF-8")
 
-                response = client.add_secret_version(
-                    request={
-                        "parent": secret_name,
-                        "payload": {"data": payload}
-                    }
+                client.add_secret_version(
+                    request={"parent": secret_name, "payload": {"data": payload}}
                 )
                 self._last_saved_refresh_token = self.refresh_token
-                console.print("[green]🔐 Nowy refresh token zapisany do Secret Manager[/green]")
+                console.print("[green]🔐 Tokeny zapisane do Secret Manager[/green]")
+
+                # AUTO-CLEANUP: Wyłącz stare wersje (max 3 aktywne)
+                self._cleanup_old_secret_versions(client, project_id)
 
             except Exception as e:
-                console.print(f"[yellow]⚠️ Nie udało się zaktualizować tokenów w Secret Manager: {e}[/yellow]")
+                console.print(f"[yellow]⚠️ Nie udało się zapisać tokenów w Secret Manager: {e}[/yellow]")
         elif project_id:
-            console.print("[dim]ℹ️ Refresh token bez zmian - pomijam zapis do Secret Manager (oszczędność kosztów)[/dim]")
+            console.print("[dim]ℹ️ Refresh token bez zmian - pomijam zapis[/dim]")
+
+    def _cleanup_old_secret_versions(self, client, project_id: str):
+        """
+        Usuwa (destroy) stare wersje sekretu fleet-tokens (zostaw ostatnie 3).
+        Zniszczone wersje są permanentnie usunięte i nie zaśmiecają konsoli.
+        """
+        try:
+            parent = f"projects/{project_id}/secrets/fleet-tokens"
+            versions = list(client.list_secret_versions(request={"parent": parent}))
+
+            # Filtruj tylko włączone wersje
+            from google.cloud.secretmanager_v1.types import SecretVersion
+            enabled = [v for v in versions if v.state == SecretVersion.State.ENABLED]
+
+            # Sortuj od najnowszej do najstarszej
+            enabled.sort(key=lambda v: v.create_time, reverse=True)
+
+            # Usuń (destroy) wszystkie oprócz 3 najnowszych
+            destroyed_count = 0
+            for old_version in enabled[3:]:
+                try:
+                    client.destroy_secret_version(request={"name": old_version.name})
+                    destroyed_count += 1
+                except Exception:
+                    pass  # Ignoruj błędy pojedynczych wersji
+
+            if destroyed_count > 0:
+                console.print(f"[dim]🗑️ Usunięto {destroyed_count} starych wersji sekretu[/dim]")
+
+        except Exception as e:
+            console.print(f"[yellow]⚠️ Cleanup wersji nie powiódł się: {e}[/yellow]")
     
     def _clear_tokens(self):
         """Czyści tokeny z pamięci i pliku"""
@@ -358,7 +383,6 @@ class TeslaFleetAPIClient:
 
             if token_data.get('expires_at'):
                 expires_str = token_data['expires_at']
-                # NAPRAWKA: Zapewnij timezone-aware datetime dla porównań
                 if expires_str.endswith('Z'):
                     expires_str = expires_str.replace('Z', '+00:00')
                 self.token_expires_at = datetime.fromisoformat(expires_str)

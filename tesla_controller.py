@@ -920,13 +920,14 @@ class TeslaController:
             console.print(f"[yellow]Błąd pobierania lokalizacji pojazdu ({e}) - używam domyślnej z .env: {self.default_latitude:.6f}, {self.default_longitude:.6f}[/yellow]")
             return self.default_latitude, self.default_longitude
 
-    def add_charge_schedule(self, schedule: ChargeSchedule) -> bool:
+    def add_charge_schedule(self, schedule: ChargeSchedule, skip_wake: bool = False) -> bool:
         """
         Dodaje harmonogram ładowania używając Fleet API
-        
+
         Args:
             schedule: Obiekt ChargeSchedule z parametrami harmonogramu
-            
+            skip_wake: Jeśli True, pomija wake_up (użyj gdy pojazd już obudzony)
+
         Returns:
             bool: True jeśli harmonogram został dodany pomyślnie
         """
@@ -943,9 +944,10 @@ class TeslaController:
             # Sprawdź czy proxy jest dostępny (używamy dla wake_up i komendy)
             use_proxy = bool(hasattr(self.fleet_api, 'proxy_url') and self.fleet_api.proxy_url)
 
-            # Wybudź pojazd z tym samym ustawieniem proxy co komenda
-            if not self.wake_up_vehicle(use_proxy=use_proxy):
-                return False
+            # Wybudź pojazd z tym samym ustawieniem proxy co komenda (chyba że skip_wake=True)
+            if not skip_wake:
+                if not self.wake_up_vehicle(use_proxy=use_proxy):
+                    return False
 
             # Ustaw lokalizację jeśli nie została podana
             if schedule.lat == 0.0 and schedule.lon == 0.0:
@@ -1129,13 +1131,14 @@ class TeslaController:
         
         console.print(table)
 
-    def remove_charge_schedule(self, schedule_id: int) -> bool:
+    def remove_charge_schedule(self, schedule_id: int, skip_wake: bool = False) -> bool:
         """
         Usuwa harmonogram ładowania używając Fleet API
-        
+
         Args:
             schedule_id: ID harmonogramu ładowania
-            
+            skip_wake: Jeśli True, pomija wake_up (użyj gdy pojazd już obudzony)
+
         Returns:
             bool: True jeśli harmonogram został usunięty pomyślnie
         """
@@ -1149,9 +1152,10 @@ class TeslaController:
             return False
         
         try:
-            # Komenda wymaga proxy - użyj go też dla wake_up
-            if not self.wake_up_vehicle(use_proxy=True):
-                return False
+            # Komenda wymaga proxy - użyj go też dla wake_up (chyba że skip_wake=True)
+            if not skip_wake:
+                if not self.wake_up_vehicle(use_proxy=True):
+                    return False
 
             # WAŻNE: Komendy modyfikujące harmonogram wymagają użycia proxy
             console.print(f"[yellow]Usuwanie harmonogramu ładowania (ID: {schedule_id}) przez Tesla HTTP Proxy...[/yellow]")

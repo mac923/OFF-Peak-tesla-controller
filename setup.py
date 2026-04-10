@@ -96,7 +96,7 @@ TESLA_TIMEOUT={timeout}
 # Opcjonalne ustawienia dla Fleet API (jeśli używasz)
 # TESLA_CLIENT_ID=your_client_id
 # TESLA_CLIENT_SECRET=your_client_secret
-# TESLA_DOMAIN=https://www.offpeakcharge.tech
+# TESLA_DOMAIN=https://off-peak-charge-v2.vercel.app
 """
     
     try:

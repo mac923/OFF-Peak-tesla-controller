@@ -11,18 +11,19 @@ spec:
         autoscaling.knative.dev/maxScale: "1"
         # Szybki cold start
         run.googleapis.com/execution-environment: gen2
-        run.googleapis.com/cpu-throttling: "false"
-        # Dłuższy timeout dla operacji z Tesla HTTP Proxy
-        run.googleapis.com/timeout: "600"
-        # NAPRAWKA: Wymuszenie nowej rewizji po wdrożeniu Special Charging fix
-        deployment.timestamp: "2025-08-13T14:00:00Z"
+        run.googleapis.com/cpu-throttling: "true"
+        # Timeout dla operacji z Tesla HTTP Proxy (zoptymalizowany z 600s)
+        run.googleapis.com/timeout: "300"
+        # OPTYMALIZACJA v2: CPU Throttling + mniejsze zasoby + eliminacja get_secret()
+        # 2026-02-01T20:00 - Aktualizacja tesla-http-proxy do najnowszej wersji (fix dla issue #186)
+        deployment.timestamp: "2026-02-01T20:00:00Z"
     spec:
-      # Timeout dla całego kontenera
-      timeoutSeconds: 600
+      # Timeout dla całego kontenera (zoptymalizowany z 600s)
+      timeoutSeconds: 300
       containerConcurrency: 1
       containers:
       - name: tesla-worker
-        image: gcr.io/off-peak-tesla-controller/tesla-worker:latest
+        image: europe-west1-docker.pkg.dev/off-peak-tesla-controller/cloud-run-source-deploy/tesla-worker:latest
         ports:
         - containerPort: 8080
         env:
@@ -37,22 +38,21 @@ spec:
           value: "tesla-monitor-data-off-peak-tesla-controller"
         
         # Tesla API Configuration
+        # OPTYMALIZACJA: CLIENT_ID jest stały - nie potrzebuje Secret Manager
         - name: TESLA_CLIENT_ID
-          valueFrom:
-            secretKeyRef:
-              name: tesla-client-id
-              key: latest
+          value: "e4ac68f1-5171-41e3-b28e-e88dbc0e2a19"
         - name: TESLA_CLIENT_SECRET
           valueFrom:
             secretKeyRef:
               name: tesla-client-secret
               key: latest
-        - name: TESLA_REFRESH_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: tesla-refresh-token
-              key: latest
-        
+        # OPTYMALIZACJA: Stałe wartości Fleet API - nie potrzebują Secret Manager
+        - name: TESLA_DOMAIN
+          value: "off-peak-charge-v2.vercel.app"
+        - name: TESLA_PUBLIC_KEY_URL
+          value: "https://off-peak-charge-v2.vercel.app/.well-known/appspecific/com.tesla.3p.public-key.pem"
+        # OPTYMALIZACJA: TESLA_REFRESH_TOKEN usunięty - tokeny pobierane z fleet-tokens
+
         # Tesla HTTP Proxy Configuration (Smart Proxy Mode)
         - name: TESLA_SMART_PROXY_MODE
           value: "true"
@@ -77,6 +77,9 @@ spec:
             secretKeyRef:
               name: OFF_PEAK_CHARGE_API_KEY
               key: latest
+        # OPTYMALIZACJA: URL jest stały - nie potrzebuje Secret Manager
+        - name: OFF_PEAK_CHARGE_API_URL
+          value: "https://off-peak-charge-v2.vercel.app/api/external-calculate"
         
         # Special Charging - Google Sheets Integration
         - name: GOOGLE_SHEETS_URL
@@ -99,13 +102,14 @@ spec:
           value: "https://tesla-worker-74pl3bqokq-ew.a.run.app"
         
         resources:
-          # WORKER: Więcej zasobów dla pełnej logiki z proxy
+          # WORKER: Gen2 wymaga min 1 CPU i 512Mi RAM
+          # CPU Throttling=true oznacza że płacimy tylko za faktyczne użycie CPU (~40% oszczędności)
           requests:
-            cpu: "1"
-            memory: "1Gi"
+            cpu: "0.5"
+            memory: "256Mi"
           limits:
-            cpu: "2"
-            memory: "2Gi"
+            cpu: "1"
+            memory: "512Mi"
         
         # Health check - Worker Service
         livenessProbe:

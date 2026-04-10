@@ -653,22 +653,34 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             self._send_response(500, {"error": str(e)})
     
     def _handle_midnight_wake(self):
-        """Obsługuje nocne wybudzenie pojazdu (kompatybilność z poprzednią wersją)"""
+        """Obsługuje nocne wybudzenie pojazdu + Special Charging check (zintegrowane)"""
         try:
             warsaw_time = self.monitor._get_warsaw_time()
             time_str = warsaw_time.strftime("[%H:%M]")
-            
+
             logger.info(f"🌙 [WORKER] Uruchamianie nocnego wybudzenia pojazdu")
-            
+
             start_time = datetime.now(timezone.utc)
-            
+
             try:
                 self.monitor.run_midnight_wake_check()
+
+                # OPTYMALIZACJA KOSZTÓW: Sprawdź Special Charging przy okazji midnight wake
+                # Eliminuje potrzebę osobnego Cloud Scheduler job (~1 zł/miesiąc oszczędności)
+                special_charging_result = None
+                try:
+                    logger.info("🔋 [WORKER] Sprawdzanie Special Charging (zintegrowane z midnight wake)")
+                    special_charging_result = self._perform_daily_special_charging_check({})
+                    logger.info(f"✅ [WORKER] Special Charging check zakończony")
+                except Exception as sc_error:
+                    logger.warning(f"⚠️ [WORKER] Special Charging check failed (non-critical): {sc_error}")
+                    special_charging_result = {"error": str(sc_error)}
+
                 execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
-                
+
                 response = {
                     "status": "success",
-                    "message": "Midnight wake check completed",
+                    "message": "Midnight wake check completed (with Special Charging)",
                     "trigger": "cloud_scheduler_worker_failsafe",
                     "execution_time_seconds": round(execution_time, 3),
                     "timestamp": start_time.isoformat(),
@@ -676,16 +688,17 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                         "service": "tesla-worker",
                         "action": "midnight_wake_check",
                         "cost_per_execution": f"~{round(execution_time * 0.1, 2)} groszy"
-                    }
+                    },
+                    "special_charging_check": special_charging_result
                 }
-                
-                logger.info(f"✅ [WORKER] Nocne wybudzenie zakończone w {execution_time:.3f}s")
+
+                logger.info(f"✅ [WORKER] Nocne wybudzenie + Special Charging zakończone w {execution_time:.3f}s")
                 self._send_response(200, response)
-                
+
             except Exception as e:
                 execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
                 logger.error(f"❌ [WORKER] Błąd nocnego wybudzenia: {e}")
-                
+
                 response = {
                     "status": "error",
                     "error": str(e),
@@ -693,9 +706,9 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                     "execution_time_seconds": round(execution_time, 3),
                     "timestamp": start_time.isoformat()
                 }
-                
+
                 self._send_response(500, response)
-                
+
         except Exception as e:
             logger.error(f"❌ Błąd obsługi midnight wake: {e}")
             self._send_response(500, {"error": str(e)})
@@ -2102,16 +2115,20 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             
             # Opcja B: Slot poprzedniego wieczoru (22:00-xx:xx)
             current_time = self.monitor._get_warsaw_time()
-            
+            min_valid_time = current_time + timedelta(minutes=5)  # Margines 5 minut
+
             # Jeśli sprawdzenie jest po północy, sprawdź slot z poprzedniego wieczoru
             if current_time.hour <= 6:  # Sprawdzenie między 00:00-06:00
                 previous_evening_start = target_datetime.replace(hour=22, minute=0) - timedelta(days=1)
                 previous_evening_end = previous_evening_start + timedelta(hours=required_hours)
-                
+
                 logger.info(f"🔍 [SPECIAL] STRATEGIA 2B: Sprawdzam slot poprzedniego wieczoru: {previous_evening_start.strftime('%H:%M')}-{previous_evening_end.strftime('%H:%M')}")
-                
+
+                # WALIDACJA: Sprawdź czy slot jest w przyszłości
+                if previous_evening_start < min_valid_time:
+                    logger.warning(f"⚠️ [SPECIAL] STRATEGIA 2B: Slot {previous_evening_start.strftime('%H:%M')} już minął (current: {current_time.strftime('%H:%M')}) - pomijam")
                 # Sprawdź czy kończy się przed 02:00 (dobry slot nocny)
-                if previous_evening_end.hour <= 2 or previous_evening_end.hour >= 22:
+                elif previous_evening_end.hour <= 2 or previous_evening_end.hour >= 22:
                     if self._slot_avoids_peak_hours(previous_evening_start, previous_evening_end):
                         send_time = previous_evening_start - timedelta(hours=1)  # Krócej niż zwykle
                         logger.info(f"✅ [SPECIAL] STRATEGIA 2B: Znaleziono slot poprzedniego wieczoru")
@@ -2128,9 +2145,14 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                     slot_start = target_datetime.replace(hour=start_hour, minute=0) - timedelta(days=1)
                 else:
                     slot_start = target_datetime.replace(hour=start_hour, minute=0)
-                
+
                 slot_end = slot_start + timedelta(hours=required_hours)
-                
+
+                # WALIDACJA: Sprawdź czy slot jest w przyszłości
+                if slot_start < min_valid_time:
+                    logger.info(f"⚠️ [SPECIAL] STRATEGIA 2C: Slot {slot_start.strftime('%H:%M')} już minął - pomijam")
+                    continue
+
                 # Sprawdź czy slot jest przed target_datetime i unika peak hours
                 if slot_end < target_datetime and self._slot_avoids_peak_hours(slot_start, slot_end):
                     send_time = slot_start - timedelta(hours=1.5)
@@ -2156,23 +2178,31 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
         """
         try:
             logger.info(f"🔍 [SPECIAL] STRATEGIA 3: Szukam slotu z minimalną kolizją z peak hours")
-            
+
+            current_time = self.monitor._get_warsaw_time()
+            min_valid_time = current_time + timedelta(minutes=5)  # Margines 5 minut
+
             # Sprawdź różne opcje startowe wokół optymalnego czasu
             base_start = target_datetime - timedelta(hours=required_hours + SAFETY_BUFFER_HOURS)
-            
+
             for hour_offset in [0, -1, -2, -3, 1]:  # Sprawdź różne przesunięcia
                 slot_start = base_start.replace(minute=0) + timedelta(hours=hour_offset)
                 slot_end = slot_start + timedelta(hours=required_hours)
-                
+
+                # WALIDACJA: Sprawdź czy slot jest w przyszłości
+                if slot_start < min_valid_time:
+                    logger.info(f"⚠️ [SPECIAL] STRATEGIA 3: Slot {slot_start.strftime('%H:%M')} już minął - pomijam")
+                    continue
+
                 # Sprawdź czy slot jest w rozsądnym przedziale czasowym
                 if slot_end > target_datetime:
                     continue
-                
+
                 collision_hours = self._calculate_peak_collision(slot_start, slot_end)
                 collision_percentage = (collision_hours / required_hours) * 100
-                
+
                 logger.info(f"🔍 [SPECIAL] STRATEGIA 3: Slot {slot_start.strftime('%H:%M')}-{slot_end.strftime('%H:%M')} ma {collision_hours:.1f}h kolizji ({collision_percentage:.1f}%)")
-                
+
                 # Akceptuj slot z maksymalnie 50% kolizji
                 if collision_percentage <= 50:
                     send_time = slot_start - timedelta(hours=2)
@@ -2185,7 +2215,7 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                         'collision_percentage': collision_percentage,
                         'strategy': 'minimal_collision'
                     }
-            
+
             logger.info(f"⚠️ [SPECIAL] STRATEGIA 3: Wszystkie sloty mają >50% kolizji z peak hours")
             return None
             
@@ -2199,20 +2229,32 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
         Minimalny buffer bezpieczeństwa ale gwarantuje docelowy poziom baterii
         """
         try:
+            current_time = self.monitor._get_warsaw_time()
+            min_valid_time = current_time + timedelta(minutes=5)  # Margines 5 minut
+
             # Minimalny buffer 0.5h zamiast 1.5h
             latest_start = target_datetime - timedelta(hours=required_hours + 0.5)
             slot_start = latest_start.replace(minute=0, second=0, microsecond=0)
+
+            # WALIDACJA: Jeśli optymalny slot jest w przeszłości, zacznij od teraz
+            if slot_start < min_valid_time:
+                logger.warning(f"⚠️ [SPECIAL] STRATEGIA 4: Optymalny slot {slot_start.strftime('%H:%M')} już minął - zaczynam od teraz")
+                slot_start = min_valid_time.replace(second=0, microsecond=0) + timedelta(minutes=5)
+
             slot_end = slot_start + timedelta(hours=required_hours)
-            
+
             collision_hours = self._calculate_peak_collision(slot_start, slot_end)
             collision_percentage = (collision_hours / required_hours) * 100
-            
+
             logger.warning(f"🚨 [SPECIAL] STRATEGIA 4 (FALLBACK): Slot {slot_start.strftime('%H:%M')}-{slot_end.strftime('%H:%M')}")
             logger.warning(f"🚨 [SPECIAL] Kolizja z peak hours: {collision_hours:.1f}h ({collision_percentage:.1f}%)")
             logger.warning(f"🚨 [SPECIAL] UZASADNIENIE: Zapewnia docelowy poziom baterii na czas!")
-            
+
             send_time = slot_start - timedelta(hours=1)  # Krótszy czas przygotowania
-            
+            # Jeśli send_time jest w przeszłości, ustaw na teraz
+            if send_time < min_valid_time:
+                send_time = min_valid_time
+
             return {
                 'start': slot_start,
                 'end': slot_end,
@@ -2222,15 +2264,17 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                 'strategy': 'fallback',
                 'fallback': True
             }
-            
+
         except Exception as e:
             logger.error(f"❌ [SPECIAL] Błąd STRATEGIA 4: {e}")
-            # Ostateczny fallback
-            latest_start = target_datetime - timedelta(hours=required_hours)
+            # Ostateczny fallback - zacznij natychmiast
+            current_time = self.monitor._get_warsaw_time()
+            slot_start = current_time + timedelta(minutes=10)
+            slot_end = slot_start + timedelta(hours=required_hours)
             return {
-                'start': latest_start,
-                'end': target_datetime,
-                'send_time': latest_start - timedelta(minutes=30),
+                'start': slot_start,
+                'end': slot_end,
+                'send_time': current_time + timedelta(minutes=5),
                 'strategy': 'emergency_fallback',
                 'fallback': True
             }
