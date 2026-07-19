@@ -449,34 +449,62 @@ class TeslaController:
             console.print(f"[yellow]🔄 Budzenie pojazdu {proxy_info}...[/yellow]")
 
             success = self.fleet_api.wake_vehicle(vehicle_id, use_proxy=use_proxy)
-            if success:
-                console.print(f"[yellow]⏳ Oczekiwanie na obudzenie pojazdu (max 30s)...[/yellow]")
-                # Czekanie na obudzenie pojazdu
-                for i in range(30):  # Maksymalnie 30 sekund
-                    time.sleep(1)
-                    # Odświeżenie danych pojazdu
-                    vehicles = self.fleet_api.get_vehicles()
-                    for vehicle in vehicles:
-                        if vehicle.get('vin') == self.current_vehicle.get('vin'):
-                            self.current_vehicle = vehicle
-                            break
 
-                    if self.current_vehicle.get('state') == 'online':
-                        console.print(f"[green]✅ Pojazd obudzony po {i+1}s[/green]")
-                        break
-            else:
-                console.print(f"[red]❌ Komenda wake_up nie powiodła się[/red]")
-
-            if self.current_vehicle.get('state') == 'online':
-                return True
-            else:
-                console.print(f"[red]⏰ Timeout wake_up - pojazd nie odpowiedział w 30s[/red]")
+            if not success:
+                # Komenda wake mogła zawieść (np. timeout proxy), choć pojazd JEST online —
+                # zdecyduj na podstawie ŚWIEŻEGO odczytu, nigdy migawki z connect()
+                console.print(f"[red]❌ Komenda wake_up nie powiodła się - sprawdzam świeży stan pojazdu[/red]")
+                fresh_state = self._refresh_vehicle_state()
+                if fresh_state == 'online':
+                    console.print(f"[green]✅ Pojazd mimo to online (świeży odczyt)[/green]")
+                    return True
+                console.print(f"[red]❌ Pojazd nie jest online (świeży stan: {fresh_state or 'nieznany'})[/red]")
                 return False
+
+            # Polling z backoffem do ~90s — zimny pojazd potrafi wstawać 60-90s,
+            # a 30 odpytań co 1s ryzykowało HTTP 429
+            console.print(f"[yellow]⏳ Oczekiwanie na obudzenie pojazdu (max ~90s)...[/yellow]")
+            waited = 0
+            for delay in (2, 2, 3, 5, 5, 8, 10, 10, 15, 15, 15):
+                time.sleep(delay)
+                waited += delay
+                fresh_state = self._refresh_vehicle_state()
+                if fresh_state == 'online':
+                    console.print(f"[green]✅ Pojazd obudzony po ~{waited}s[/green]")
+                    return True
+                if fresh_state is None:
+                    # Błąd odczytu listy pojazdów — nie decyduj na stale cache, próbuj dalej
+                    console.print(f"[yellow]⚠️ Błąd odczytu stanu (po {waited}s) - ponawiam[/yellow]")
+
+            console.print(f"[red]⏰ Timeout wake_up - pojazd nie odpowiedział w ~{waited}s[/red]")
+            return False
             
         except Exception as e:
             console.print(f"[red]Błąd podczas budzenia pojazdu: {e}[/red]")
             return False
     
+    def _refresh_vehicle_state(self) -> Optional[str]:
+        """
+        Świeży odczyt stanu wybranego pojazdu z listy pojazdów.
+        Aktualizuje current_vehicle przy trafieniu.
+
+        Returns:
+            str: stan pojazdu ('online'/'asleep'/'offline'...)
+            None: błąd odczytu — NIE oznacza offline; wołający nie może
+                  podejmować decyzji na podstawie starego cache
+        """
+        try:
+            vehicles = self.fleet_api.get_vehicles()
+            if not vehicles:
+                return None
+            for vehicle in vehicles:
+                if vehicle.get('vin') == self.current_vehicle.get('vin'):
+                    self.current_vehicle = vehicle
+                    return vehicle.get('state')
+            return None
+        except Exception:
+            return None
+
     def get_all_vehicles(self) -> List[Dict]:
         """
         Zwraca listę wszystkich pojazdów (kompatybilność z Worker Service)
@@ -505,11 +533,16 @@ class TeslaController:
             return {}
         
         try:
-            # Sprawdzenie czy pojazd jest online - BEZ BUDZENIA
-            vehicle_state = self.current_vehicle.get('state', 'offline')
-            
+            # ŚWIEŻY stan zamiast migawki z connect() — cache mógł się zdezaktualizować
+            # (auto zasnęło/obudziło się od ostatniego odczytu), a decyzje online/offline
+            # na stale cache pomijały wpięcie kabla albo raportowały fałszywy offline
+            fresh_state = self._refresh_vehicle_state()
+            vehicle_state = fresh_state if fresh_state is not None else self.current_vehicle.get('state', 'offline')
+
             if vehicle_state != 'online':
-                # Pojazd offline - zwróć podstawowe informacje BEZ BUDZENIA
+                # Pojazd offline/asleep - zwróć podstawowe informacje BEZ BUDZENIA.
+                # UWAGA: wcześniejsze "dotknięcie budzenia" przy cache=online budziło
+                # śpiący pojazd przy każdym odczycie statusu (vampire drain) — usunięte.
                 return {
                     'vehicle_state': vehicle_state,
                     'display_name': self.current_vehicle.get('display_name', 'Nieznany'),
@@ -517,13 +550,8 @@ class TeslaController:
                     'online': False,
                     'timestamp': int(time.time() * 1000)
                 }
-            
-            # Pojazd jest ONLINE - możemy bezpiecznie "dotknąć" budzenia i pobrać pełne dane
-            
-            # "Dotknij" budzenia - gdy pojazd jest już online, to tylko potwierdzi status
-            self.wake_up_vehicle()
-            
-            # Pobierz pełne dane pojazdu (nie tylko charge_state i drive_state)
+
+            # Pojazd jest ONLINE - pobierz pełne dane pojazdu (bez komendy wake)
             
             # Pobierz standardowe dane pojazdu
             vehicle_data = self.fleet_api.get_vehicle_data(vehicle_id)
@@ -617,24 +645,34 @@ class TeslaController:
         """
         current_lat = drive_state.get('latitude')
         current_lon = drive_state.get('longitude')
-        
+
         if not current_lat or not current_lon:
-            # Brak danych GPS z pojazdu - Tesla Fleet API nie udostępnia lokalizacji
-            # ze względów prywatności. Używamy domyślnej lokalizacji HOME z .env
-            return 'HOME'  # Zakładamy że pojazd jest w domu gdy brak danych GPS
-        
+            # Brak danych GPS. Założenie "brak GPS = HOME" pozwalało zarządzać
+            # harmonogramami auta wpiętego np. na publicznej ładowarce.
+            # SHADOW MODE: domyślnie stare zachowanie z głośnym logiem;
+            # LOCATION_UNKNOWN_ON_MISSING_GPS=true włącza UNKNOWN (warunek A
+            # wymaga wtedy potwierdzonego HOME).
+            if os.getenv('LOCATION_UNKNOWN_ON_MISSING_GPS', 'false').lower() == 'true':
+                console.print("[yellow]📍 Brak GPS → UNKNOWN (enforce)[/yellow]")
+                return 'UNKNOWN'
+            console.print("[yellow]👻 [SHADOW] Brak GPS — zakładam HOME (docelowo UNKNOWN; "
+                          "włącz LOCATION_UNKNOWN_ON_MISSING_GPS=true po weryfikacji)[/yellow]")
+            return 'HOME'
+
         # Użyj promienia z Secret Manager lub zmiennej środowiskowej
         home_radius = self.home_radius
-        
+
         # Oblicz odległość od punktu HOME
         home_lat = self.default_latitude
         home_lon = self.default_longitude
-        
-        # Proste obliczenie odległości (dla małych odległości wystarczające)
+
+        # Odległość w stopniach z korektą cos(szerokości): bez niej strefa "dom"
+        # była elipsą (na 52°N stopień długości ≈ 0.62 stopnia szerokości)
+        import math
         lat_diff = abs(current_lat - home_lat)
-        lon_diff = abs(current_lon - home_lon)
+        lon_diff = abs(current_lon - home_lon) * math.cos(math.radians(home_lat))
         distance = (lat_diff ** 2 + lon_diff ** 2) ** 0.5
-        
+
         if distance <= home_radius:
             return 'HOME'
         else:
@@ -902,8 +940,10 @@ class TeslaController:
             return self.default_latitude, self.default_longitude
         
         try:
-            # Próba pobrania obecnej lokalizacji pojazdu
-            vehicle_data = self.fleet_api.get_vehicle_data(vehicle_id)
+            # Próba pobrania obecnej lokalizacji pojazdu.
+            # NAPRAWKA: GPS przychodzi TYLKO z endpoints="location_data" —
+            # bez tego parametru lokalizacja zawsze spadała na domyślną z .env
+            vehicle_data = self.fleet_api.get_vehicle_data(vehicle_id, endpoints="location_data")
             drive_state = vehicle_data.get('drive_state', {})
             
             current_lat = drive_state.get('latitude')

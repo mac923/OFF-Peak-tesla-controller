@@ -751,11 +751,13 @@ def is_at_home(latitude: float, longitude: float) -> bool:
     # Używaj globalnych zmiennych (zainicjalizowanych przy starcie)
     global HOME_LATITUDE, HOME_LONGITUDE, HOME_RADIUS
     
-    # Oblicz odległość (uproszczona formuła dla małych odległości)
+    # Odległość w stopniach z korektą cos(szerokości) — bez niej strefa "dom"
+    # była elipsą rozciągniętą w osi N-S (na 52°N o ~60%)
+    import math
     lat_diff = abs(latitude - HOME_LATITUDE)
-    lon_diff = abs(longitude - HOME_LONGITUDE)
+    lon_diff = abs(longitude - HOME_LONGITUDE) * math.cos(math.radians(HOME_LATITUDE))
     distance = (lat_diff ** 2 + lon_diff ** 2) ** 0.5
-    
+
     return distance <= HOME_RADIUS
 
 def check_conditions_a_b(location_data: Dict[str, Any], last_state: Optional[Dict[str, Any]], vin: str) -> tuple[bool, str]:

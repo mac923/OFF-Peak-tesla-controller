@@ -582,10 +582,32 @@ class CloudTeslaMonitor:
                     case_id: VehicleMonitoringCase.from_dict(case_data)
                     for case_id, case_data in state_data.get('active_cases', {}).items()
                 }
+
+                # PERSYSTENCJA STANU DECYZYJNEGO (Faza 4): bez tego każdy cold start
+                # (scale-to-zero!) widział pusty stan → pełny rewrite harmonogramów
+                # przy każdym triggerze z wpiętym autem. TTL 24h: stan starszy niż doba
+                # traktujemy jak pierwszy kontakt (bateria/plan mogły się zmienić).
+                state_age_ok = False
+                last_update_str = state_data.get('last_update')
+                if last_update_str:
+                    try:
+                        last_update = datetime.fromisoformat(last_update_str)
+                        state_age_ok = (self._get_warsaw_time() - last_update) <= timedelta(hours=24)
+                    except (ValueError, TypeError):
+                        state_age_ok = False
+
+                if state_age_ok:
+                    self.last_off_peak_schedules = state_data.get('last_off_peak_schedules', {})
+                    self.last_vehicle_state = state_data.get('last_vehicle_state', {})
+                    logger.info(f"Załadowano stan decyzyjny: {len(self.last_off_peak_schedules)} hashy planów, "
+                                f"{len(self.last_vehicle_state)} stanów pojazdów")
+                else:
+                    logger.info("Stan decyzyjny starszy niż 24h lub bez znacznika czasu - ignoruję (pierwszy kontakt)")
+
                 logger.info(f"Załadowano stan monitorowania: {len(self.active_cases)} aktywnych przypadków")
             else:
                 logger.info("Brak zapisanego stanu monitorowania - rozpoczynam z pustym stanem")
-                
+
         except Exception as e:
             logger.error(f"Błąd ładowania stanu monitorowania: {e}")
     
@@ -2804,8 +2826,9 @@ class CloudTeslaMonitor:
                 
                 # Oblicz odległość od domu (proste przybliżenie)
                 if schedule_lat != 0.0 and schedule_lon != 0.0:
+                    import math
                     lat_diff = abs(schedule_lat - home_lat)
-                    lon_diff = abs(schedule_lon - home_lon)
+                    lon_diff = abs(schedule_lon - home_lon) * math.cos(math.radians(home_lat))
                     distance = (lat_diff**2 + lon_diff**2)**0.5
                     
                     if distance <= home_radius:
