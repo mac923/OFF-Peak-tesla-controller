@@ -253,10 +253,13 @@ class TeslaFleetAPIClient:
             self._last_saved_refresh_token != self.refresh_token
         )
 
-        # Zapisz lokalnie (zawsze)
+        # Zapisz lokalnie (zawsze) — atomowo (temp + rename), żeby crash w trakcie
+        # zapisu lub równoległy zapis nie zostawił uszkodzonego pliku fallbacku
         try:
-            with open('fleet_tokens.json', 'w') as f:
+            tmp_path = 'fleet_tokens.json.tmp'
+            with open(tmp_path, 'w') as f:
                 json.dump(token_data, f)
+            os.replace(tmp_path, 'fleet_tokens.json')
             console.print("[green]✓ Tokeny zapisane lokalnie[/green]")
         except Exception as e:
             console.print(f"[yellow]⚠️ Nie udało się zapisać tokenów lokalnie: {e}[/yellow]")
@@ -507,11 +510,13 @@ class TeslaFleetAPIClient:
             if not self._load_tokens():
                 return False
         
-        # Sprawdzenie czy token nie wygasł
-        if self.token_expires_at and datetime.now(timezone.utc) >= self.token_expires_at:
+        # Sprawdzenie ważności z 5-minutowym buforem (spójnie z _are_tokens_valid) —
+        # bez bufora token potrafił wygasnąć W TRAKCIE serii komend (wake → remove → add),
+        # wydłużając sekwencję o ścieżki 401→refresh→retry
+        if self.token_expires_at and datetime.now(timezone.utc) >= self.token_expires_at - timedelta(minutes=5):
             if not self._refresh_access_token():
                 return False
-        
+
         return bool(self.access_token)
     
     def check_authorization_status(self) -> Dict[str, any]:
@@ -575,33 +580,6 @@ class TeslaFleetAPIClient:
         
         return status
     
-    def _sign_command(self, method: str, path: str, body: str = "") -> str:
-        """
-        Podpisuje komendę kluczem prywatnym
-        
-        Args:
-            method: Metoda HTTP (GET, POST, etc.)
-            path: Ścieżka API
-            body: Treść żądania
-            
-        Returns:
-            str: Podpis w formacie base64
-        """
-        # Tworzenie wiadomości do podpisania
-        timestamp = str(int(time.time()))
-        message = f"{method}\n{path}\n{body}\n{timestamp}"
-        
-        # Podpisywanie wiadomości
-        signature = self.private_key.sign(
-            message.encode('utf-8'),
-            ec.ECDSA(hashes.SHA256())
-        )
-        
-        # Kodowanie podpisu w base64
-        signature_b64 = base64.b64encode(signature).decode('utf-8')
-        
-        return f"{signature_b64}:{timestamp}"
-    
     def _make_signed_request(self, method: str, path: str, data: Dict = None, retry_auth: bool = True, use_proxy: bool = False) -> Dict:
         """
         Tworzy i wysyła podpisane żądanie do Tesla Fleet API lub przez proxy
@@ -636,8 +614,11 @@ class TeslaFleetAPIClient:
 
         url = f"{base_url}{path}"
         body = json.dumps(data) if data else ""
-        signature = self._sign_command(method, path, body)
-        
+        # UWAGA: żadnego "podpisywania" tutaj — realne podpisywanie komend vehicle-command
+        # wykonuje wyłącznie tesla-http-proxy (use_proxy=True). Wcześniejszy _sign_command
+        # liczył podpis i wyrzucał go (nigdy nie trafiał do nagłówków) — usunięty jako
+        # martwy kod sugerujący nieistniejące zabezpieczenie.
+
         headers = {
             'Authorization': f'Bearer {self.access_token}',
             'Content-Type': 'application/json'

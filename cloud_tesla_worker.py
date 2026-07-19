@@ -2538,24 +2538,26 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
         try:
             total_collision = 0.0
             
+            slot_start_minutes = start.hour * 60 + start.minute
+            slot_end_minutes = end.hour * 60 + end.minute
+
+            # Obsłuż przejście przez północ dla slotu
+            if slot_end_minutes < slot_start_minutes:
+                slot_end_minutes += 24 * 60
+
             for peak_start, peak_end in PEAK_HOURS:
-                # Konwertuj na minuty od północy
-                slot_start_minutes = start.hour * 60 + start.minute
-                slot_end_minutes = end.hour * 60 + end.minute
-                peak_start_minutes = peak_start * 60
-                peak_end_minutes = peak_end * 60
-                
-                # Obsłuż przejście przez północ dla slotu
-                if slot_end_minutes < slot_start_minutes:
-                    slot_end_minutes += 24 * 60
-                
-                # Oblicz kolizję
-                collision_start = max(slot_start_minutes, peak_start_minutes)
-                collision_end = min(slot_end_minutes, peak_end_minutes)
-                
-                if collision_start < collision_end:
-                    collision_minutes = collision_end - collision_start
-                    total_collision += collision_minutes / 60.0
+                # Slot przez północ musi kolidować także z peak hours NASTĘPNEGO dnia
+                # (np. 23:00→07:00 zahacza o poranny szczyt 6-10 jutro) — stąd offset +24h
+                for day_offset_minutes in (0, 24 * 60):
+                    peak_start_minutes = peak_start * 60 + day_offset_minutes
+                    peak_end_minutes = peak_end * 60 + day_offset_minutes
+
+                    collision_start = max(slot_start_minutes, peak_start_minutes)
+                    collision_end = min(slot_end_minutes, peak_end_minutes)
+
+                    if collision_start < collision_end:
+                        collision_minutes = collision_end - collision_start
+                        total_collision += collision_minutes / 60.0
             
             return total_collision
             
@@ -2567,19 +2569,20 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
         """Sprawdza czy slot ładowania unika peak hours"""
         try:
             # Peak hours: 6:00-10:00, 19:00-22:00
+            slot_start_hour = start.hour + start.minute / 60
+            slot_end_hour = end.hour + end.minute / 60
+
+            # Obsłuż przejście przez północ
+            if slot_end_hour < slot_start_hour:
+                slot_end_hour += 24
+
             for peak_start, peak_end in PEAK_HOURS:
-                # Sprawdź kolizję z peak hours
-                slot_start_hour = start.hour + start.minute / 60
-                slot_end_hour = end.hour + end.minute / 60
-                
-                # Obsłuż przejście przez północ
-                if slot_end_hour < slot_start_hour:
-                    slot_end_hour += 24
-                
-                # Sprawdź kolizję
-                if not (slot_end_hour <= peak_start or slot_start_hour >= peak_end):
-                    logger.info(f"⚠️ [SPECIAL] Slot {start.strftime('%H:%M')}-{end.strftime('%H:%M')} koliduje z peak hours {peak_start:02d}:00-{peak_end:02d}:00")
-                    return False
+                # Slot przez północ sprawdzamy też z peak hours następnego dnia
+                # (23:00→07:00 zahacza o poranny szczyt jutro)
+                for day_offset in (0, 24):
+                    if not (slot_end_hour <= peak_start + day_offset or slot_start_hour >= peak_end + day_offset):
+                        logger.info(f"⚠️ [SPECIAL] Slot {start.strftime('%H:%M')}-{end.strftime('%H:%M')} koliduje z peak hours {peak_start:02d}:00-{peak_end:02d}:00" + (" (następnego dnia)" if day_offset else ""))
+                        return False
             
             return True
             

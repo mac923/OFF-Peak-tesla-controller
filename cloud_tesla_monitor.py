@@ -962,17 +962,19 @@ class CloudTeslaMonitor:
                 logger.warning("⚠️ Brak zmiennej środowiskowej 'OFF_PEAK_CHARGE_API_KEY'")
                 return _create_fallback_response("brak klucza API")
             
-            # Przygotuj dane żądania zgodnie z dokumentacją
+            # Przygotuj dane żądania zgodnie z dokumentacją.
+            # Parametry pojazdu z env — wcześniej zahardkodowane wartości liczyły
+            # plan dla "statystycznego" auta, nie rzeczywistego
             request_data = {
                 "batteryLevel": battery_level,
-                "batteryCapacity": 75,
-                "consumption": 18,
-                "dailyMileage": 50,
+                "batteryCapacity": float(os.getenv('VEHICLE_BATTERY_CAPACITY_KWH', '75')),
+                "consumption": float(os.getenv('VEHICLE_CONSUMPTION_KWH_100KM', '18')),
+                "dailyMileage": float(os.getenv('VEHICLE_DAILY_MILEAGE_KM', '50')),
                 "chargeLimits": {
-                    "optimalUpper": 0.8,
-                    "optimalLower": 0.5,
-                    "emergency": 0.2,
-                    "chargingRate": 11
+                    "optimalUpper": float(os.getenv('CHARGE_LIMIT_OPTIMAL_UPPER', '0.8')),
+                    "optimalLower": float(os.getenv('CHARGE_LIMIT_OPTIMAL_LOWER', '0.5')),
+                    "emergency": float(os.getenv('CHARGE_LIMIT_EMERGENCY', '0.2')),
+                    "chargingRate": float(os.getenv('VEHICLE_CHARGING_RATE_KW', '11'))
                 }
             }
             
@@ -2750,16 +2752,24 @@ class CloudTeslaMonitor:
         Returns:
             bool: True jeśli harmonogramy się nakładają
         """
-        # Obsługa przejścia przez północ (end_time może być > 1440)
-        start1 = schedule1.start_time
-        end1 = schedule1.end_time if schedule1.end_time <= 1440 else schedule1.end_time - 1440
-        
-        start2 = schedule2.start_time  
-        end2 = schedule2.end_time if schedule2.end_time <= 1440 else schedule2.end_time - 1440
-        
-        # Sprawdź nakładanie: harmonogramy nakładają się jeśli:
-        # - start1 < end2 AND start2 < end1
-        return start1 < end2 and start2 < end1
+        # Okno przez północ dzielimy na segmenty w obrębie doby — poprzednia
+        # formuła (start1<end2 AND start2<end1) po normalizacji end<start
+        # NIE wykrywała realnych nakładań okien typu 23:00-01:00
+        def _segments(s: ChargeSchedule):
+            start = s.start_time % 1440
+            end = s.end_time - 1440 if s.end_time > 1440 else s.end_time
+            end = end % 1440 if end != 1440 else 0
+            if start < end:
+                return [(start, end)]
+            if start == end:
+                return []  # okno zerowej długości
+            return [(start, 1440), (0, end)]  # przez północ
+
+        for a_start, a_end in _segments(schedule1):
+            for b_start, b_end in _segments(schedule2):
+                if a_start < b_end and b_start < a_end:
+                    return True
+        return False
     
     def _get_home_schedules_from_tesla(self, vehicle_vin: str) -> List[Dict]:
         """

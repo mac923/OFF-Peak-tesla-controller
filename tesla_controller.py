@@ -1001,6 +1001,8 @@ class TeslaController:
                 console.print("[yellow]Dodawanie harmonogramu ładowania przez Fleet API (brak proxy)...[/yellow]")
             
             # Wywołanie Fleet API
+            # schedule.id (gdy ustawione) = aktualizacja istniejącego wpisu w miejscu —
+            # bez tego retry po timeout tworzył duplikat harmonogramu
             result = self.fleet_api.add_charge_schedule(
                 vehicle_id=vehicle_id,
                 days_of_week=schedule.days_of_week,
@@ -1012,6 +1014,7 @@ class TeslaController:
                 end_enabled=schedule.end_enabled,
                 end_time=schedule.end_time,
                 one_time=schedule.one_time,
+                schedule_id=schedule.id,
                 use_proxy=use_proxy
             )
             
