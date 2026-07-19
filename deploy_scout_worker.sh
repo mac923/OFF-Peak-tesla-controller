@@ -112,9 +112,30 @@ gcloud builds submit --config=cloudbuild-worker.yaml .
 # Zastąp placeholders w konfiguracji Worker
 sed "s/YOUR_PROJECT_ID/$PROJECT_ID/g" cloud-run-service-worker.yaml > cloud-run-service-worker-filled.yaml
 
+# KRYTYCZNE: przypnij DIGEST świeżo zbudowanego obrazu zamiast tagu :latest.
+# Cloud Run rozwiązuje :latest do digestu tylko przy TWORZENIU rewizji —
+# 'services replace' z niezmienionym YAML-em (ten sam tag) nie tworzy nowej
+# rewizji i serwis dalej serwuje STARY obraz mimo udanego builda.
+IMAGE_REPO="europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/tesla-worker"
+IMAGE_DIGEST=$(gcloud artifacts docker images describe "$IMAGE_REPO:latest" --format="value(image_summary.digest)")
+if [ -z "$IMAGE_DIGEST" ]; then
+    echo "❌ Nie można odczytać digestu obrazu $IMAGE_REPO:latest"
+    exit 1
+fi
+echo "📌 Przypinam obraz: $IMAGE_REPO@$IMAGE_DIGEST"
+sed -i '' "s|image: $IMAGE_REPO.*|image: $IMAGE_REPO@$IMAGE_DIGEST|" cloud-run-service-worker-filled.yaml
+
 # Wdrażaj Worker Service
 echo "🔧 Wdrażanie Worker Service..."
 gcloud run services replace cloud-run-service-worker-filled.yaml --region=europe-west1
+
+# Weryfikacja: rewizja obsługująca ruch musi mieć świeży digest
+SERVING_IMAGE=$(gcloud run services describe tesla-worker --region=europe-west1 --format="value(spec.template.spec.containers[0].image)")
+if [ "$SERVING_IMAGE" != "$IMAGE_REPO@$IMAGE_DIGEST" ]; then
+    echo "❌ Rewizja NIE używa świeżego obrazu: $SERVING_IMAGE"
+    exit 1
+fi
+echo "✅ Worker serwuje świeży obraz ($IMAGE_DIGEST)"
 
 # Pobierz URL Worker Service
 WORKER_SERVICE_URL=$(gcloud run services describe tesla-worker --region=europe-west1 --format="value(status.url)")

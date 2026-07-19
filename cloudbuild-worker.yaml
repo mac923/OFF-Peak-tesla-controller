@@ -7,17 +7,10 @@ steps:
 - name: 'gcr.io/cloud-builders/docker'
   args: ['push', 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/tesla-worker:latest']
 
-# Krok 3: Deploy using YAML config (lepsze zarządzanie zasobami)
-# Konfiguracja w cloud-run-service-worker.yaml
-- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-  args:
-    - 'gcloud'
-    - 'run'
-    - 'services'
-    - 'replace'
-    - 'cloud-run-service-worker.yaml'
-    - '--region'
-    - 'europe-west1'
+# UWAGA: krok deployu usunięty z cloudbuild. 'services replace' z YAML-em
+# używającym tagu :latest NIE tworzy nowej rewizji (spec bez zmian) — serwis
+# dalej serwował stary obraz. Deploy z przypiętym digestem wykonuje
+# deploy_scout_worker.sh po zakończeniu builda.
 
 timeout: '1200s'
 
