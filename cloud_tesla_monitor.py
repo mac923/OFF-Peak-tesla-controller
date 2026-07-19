@@ -872,27 +872,51 @@ class CloudTeslaMonitor:
         
         def _create_fallback_response(reason: str) -> Dict[str, Any]:
             """
-            Tworzy fallback odpowiedź z harmonogramem 13:00-15:00
+            Fallback przy awarii OFF PEAK API: domyślne okno nocne (env
+            FALLBACK_CHARGE_START_HOUR/FALLBACK_CHARGE_END_HOUR, domyślnie 23-6).
+
+            Czasy w pełnym ISO 8601 ze strefą — poprzedni format "13:00" nie
+            przechodził przez fromisoformat() w konwerterze i slot po cichu
+            znikał (pojazd zostawał z samym oknem-strażnikiem). Do tego 13:00-15:00
+            wypadało w godzinach szczytu cenowego.
             """
-            logger.warning(f"⚠️ Tworzę fallback harmonogram (powód: {reason})")
-            
-            # Stały harmonogram 13:00-15:00
-            start_minutes = 13 * 60  # 13:00 = 780 minut
-            end_minutes = 15 * 60    # 15:00 = 900 minut
-            
+            logger.warning(f"⚠️ Tworzę fallback harmonogram nocny (powód: {reason})")
+
+            start_hour = int(os.getenv('FALLBACK_CHARGE_START_HOUR', '23'))
+            end_hour = int(os.getenv('FALLBACK_CHARGE_END_HOUR', '6'))
+
+            now = self._get_warsaw_time()
+            end_today = now.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+
+            if now < end_today:
+                # Jesteśmy w trakcie okna nocnego (np. 01:30) — ładuj od teraz do końca okna
+                start_dt = now.replace(second=0, microsecond=0)
+                end_dt = end_today
+            else:
+                # Dzień — zaplanuj najbliższą noc: dziś start_hour → jutro end_hour
+                start_dt = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+                if start_dt <= now:
+                    start_dt = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+                end_dt = (now + timedelta(days=1)).replace(hour=end_hour, minute=0, second=0, microsecond=0)
+
+            duration_h = max((end_dt - start_dt).total_seconds() / 3600, 0)
+            logger.info(f"🔄 FALLBACK: okno nocne {start_dt.strftime('%Y-%m-%d %H:%M')} - {end_dt.strftime('%Y-%m-%d %H:%M')}")
+
             return {
                 "success": True,
+                "fallback": True,
+                "fallback_reason": reason,
                 "data": {
                     "summary": {
                         "scheduledSlots": 1,
-                        "totalEnergy": 22,  # Około 11kW * 2h
+                        "totalEnergy": round(11 * duration_h, 1),  # ~11 kW * czas okna
                         "totalCost": 0,
                         "averagePrice": 0
                     },
                     "chargingSchedule": [{
-                        "start_time": "13:00",
-                        "end_time": "15:00",
-                        "charge_amount": 22,
+                        "start_time": start_dt.isoformat(),
+                        "end_time": end_dt.isoformat(),
+                        "charge_amount": round(11 * duration_h, 1),
                         "cost": 0
                     }]
                 }
@@ -1432,7 +1456,8 @@ class CloudTeslaMonitor:
 
         
         # Loguj tylko jeśli to pierwsza detekcja tego stanu
-        if not (was_ready and was_home and was_online):
+        # (force = midnight/failsafe: wykonaj pełny blok niezależnie od przejścia stanu)
+        if force or not (was_ready and was_home and was_online):
             self._log_event(
                 message="Car ready for schedule",
                 battery_level=battery_level,
@@ -2050,9 +2075,11 @@ class CloudTeslaMonitor:
 
                         
                         if is_online_midnight and is_charging_ready_midnight and location_midnight == 'HOME':
-                            logger.info(f"{time_str} ✅ Po nocnym wybudzeniu: pojazd spełnia warunek A - wywołuję OFF PEAK CHARGE API")
+                            logger.info(f"{time_str} ✅ Po nocnym wybudzeniu: pojazd spełnia warunek A - wywołuję OFF PEAK CHARGE API (force)")
                             try:
-                                self._handle_condition_a(status)
+                                # force=True: midnight to failsafe — musi wymusić świeży plan
+                                # na nowy dzień nawet przy "niezmienionym" stanie/hashu
+                                self._handle_condition_a(status, force=True)
                             except Exception as api_ex:
                                 logger.error(f"❌ Błąd wywołania warunku A po nocnym wybudzeniu: {api_ex}")
                         else:
@@ -2498,6 +2525,12 @@ class CloudTeslaMonitor:
                 home_lat = float(os.getenv('HOME_LATITUDE', '52.334215'))
                 home_lon = float(os.getenv('HOME_LONGITUDE', '20.937516'))
 
+            # FAZA 2: tryb one_time — sloty (także jutrzejsze) wysyłane jako harmonogramy
+            # jednorazowe zamiast filtrowania "tylko na dziś". Auto zawsze ma realny plan
+            # nocny i nie zależy od midnight wake. Za flagą do czasu weryfikacji na aucie.
+            use_one_time = os.getenv('USE_ONE_TIME_SCHEDULES', 'false').lower() == 'true'
+            now_warsaw = self._get_warsaw_time()
+
             filtered_count = 0
             for i, slot in enumerate(charging_schedule):
                 # Parsuj czasy z formatu ISO 8601
@@ -2517,8 +2550,21 @@ class CloudTeslaMonitor:
                     start_warsaw = start_dt.astimezone(warsaw_tz)
                     end_warsaw = end_dt.astimezone(warsaw_tz)
 
-                    # Filtrowanie: przepuszczaj tylko harmonogramy na dzisiejszy dzień
-                    if not self._is_schedule_for_today(start_warsaw, end_warsaw):
+                    # Slot całkowicie miniony nie ma sensu w żadnym trybie — z days=All
+                    # wykonałby się JUTRO według DZISIEJSZYCH cen (błąd klasy L10)
+                    if end_warsaw <= now_warsaw:
+                        logger.info(f"⏰ Harmonogram #{i+1}: {start_warsaw.strftime('%Y-%m-%d %H:%M')}-"
+                                   f"{end_warsaw.strftime('%Y-%m-%d %H:%M')} - POMINIĘTY (już miniony)")
+                        filtered_count += 1
+                        continue
+
+                    if use_one_time:
+                        # Tryb one_time: przyjmujemy sloty dzisiejsze i przyszłe —
+                        # harmonogram jednorazowy wykona się w najbliższym pasującym
+                        # oknie (czyli dokładnie w zaplanowanym terminie) i zniknie
+                        pass
+                    elif not self._is_schedule_for_today(start_warsaw, end_warsaw):
+                        # Tryb legacy: przepuszczaj tylko harmonogramy na dzisiejszy dzień
                         logger.info(f"🔜 Harmonogram #{i+1}: {start_warsaw.strftime('%Y-%m-%d %H:%M')}-"
                                    f"{end_warsaw.strftime('%Y-%m-%d %H:%M')} - POMINIĘTY (nie dotyczy dzisiaj)")
                         filtered_count += 1
@@ -2551,7 +2597,7 @@ class CloudTeslaMonitor:
                         days_of_week="All",  # Wszystkie dni tygodnia
                         lat=home_lat,
                         lon=home_lon,
-                        one_time=False
+                        one_time=use_one_time
                     )
                     
                     schedules.append(schedule)
@@ -2570,46 +2616,28 @@ class CloudTeslaMonitor:
                     logger.error(f"Błąd parsowania slotu #{i+1}: {e}")
                     continue
             
-            # FALLBACK: Jeśli brak harmonogramów z OFF PEAK API, utwórz 1-minutowy slot 23:59-00:00
-            # Wykryj pusty harmonogram na podstawie:
-            # 1. Brak schedules po parsowaniu
-            # 2. Brak slotów w charging_schedule  
-            # 3. 0 scheduledSlots lub 0 totalEnergy w summary
-            is_empty_schedule = (
-                not schedules or 
-                not charging_schedule or 
-                scheduled_slots == 0 or 
-                total_energy == 0
-            )
-            
-            if is_empty_schedule:
+            # OKNO-STRAŻNIK: gdy po konwersji nie ma ŻADNEGO okna, pojazd bez
+            # harmonogramu ładowałby NATYCHMIAST po wpięciu (pełna moc, droga taryfa).
+            # Minimalne okno 23:58-23:59 "okupuje" scheduler Tesli i wymusza czekanie.
+            # (Poprzedni slot 23:59-1440 wykraczał poza zakres 0-1439 minut.)
+            if not schedules:
                 if filtered_count > 0:
-                    logger.info(f"⚠️ Wszystkie {filtered_count} harmonogramów z OFF PEAK API dotyczą przyszłych dni")
-                logger.warning("⚠️ Brak harmonogramów na dzisiaj - tworzę fallback slot 23:59-00:00")
-                
-                # Ustaw stały harmonogram fallback: 23:59-00:00 (1 minuta ładowania)
-                start_minutes = 23 * 60 + 59  # 23:59 = 1439 minut od północy
-                end_minutes = 24 * 60         # 00:00 następnego dnia = 1440 minut
-                
-                # Utwórz fallback harmonogram
-                fallback_schedule = ChargeSchedule(
+                    logger.info(f"⚠️ Wszystkie {filtered_count} sloty z OFF PEAK API pominięte (minione/przyszłe dni)")
+                logger.warning("⚠️ Brak okien do zaplanowania - tworzę okno-strażnik 23:58-23:59")
+
+                guard_schedule = ChargeSchedule(
                     enabled=True,
-                    start_time=start_minutes,
-                    end_time=end_minutes,  # Tesla API obsługuje 1440 jako 00:00 następnego dnia
+                    start_time=23 * 60 + 58,  # 23:58 = 1438
+                    end_time=23 * 60 + 59,    # 23:59 = 1439 (w zakresie 0-1439)
                     start_enabled=True,
                     end_enabled=True,
-                    days_of_week="All",  # Wszystkie dni tygodnia
+                    days_of_week="All",
                     lat=home_lat,
                     lon=home_lon,
-                    one_time=False
+                    one_time=False  # strażnik ma trwać, dopóki nie pojawi się realny plan
                 )
-                
-                schedules.append(fallback_schedule)
-                
-                logger.info(f"🔄 FALLBACK: Utworzono harmonogram ładowania 23:59-00:00:")
-                logger.info(f"   📅 Czas: 23:59-00:00 (1 minuta ładowania)")
-                logger.info(f"   📍 Minuty: {start_minutes}-{end_minutes}")
-                logger.info(f"   ⏰ Harmonogram fallback - minimalny slot przed północą")
+                schedules.append(guard_schedule)
+                logger.info(f"🛡️ STRAŻNIK: okno 23:58-23:59 (1438-1439 min) — blokuje natychmiastowe ładowanie po wpięciu")
             
             if filtered_count > 0:
                 logger.info(f"🔜 Pominięto {filtered_count} harmonogramów (dotyczą przyszłych dni)")
@@ -2920,7 +2948,8 @@ class CloudTeslaMonitor:
             logger.error(f"Błąd dodawania harmonogramów do Tesla: {e}")
             return False
     
-    def _manage_tesla_charging_schedules(self, off_peak_data: Dict[str, Any], vehicle_vin: str) -> bool:
+    def _manage_tesla_charging_schedules(self, off_peak_data: Dict[str, Any], vehicle_vin: str,
+                                         vehicle_status: Optional[Dict[str, Any]] = None) -> bool:
         """
         Zarządza harmonogramami ładowania Tesla na podstawie danych z API OFF PEAK CHARGE
         Używa Smart Proxy Mode - uruchamia proxy on-demand dla komend
@@ -3140,20 +3169,26 @@ class CloudTeslaMonitor:
                         operation_data = {
                             'operation': 'schedule_management_new_sequence',
                             'old_schedules_count': len(current_home_schedules),
-                            'added_schedules': len(resolved_schedules),
+                            'added_schedules': len(schedules_to_add),
+                            'removed_schedules': len(schedules_to_remove),
+                            'removal_success': removal_success,
                             'final_schedules': len(final_schedules) if final_schedules else 0,
-                            'operation_success': True,
+                            'operation_success': removal_success,
                             'proxy_used': True,
-                            'sequence_version': 'v3.0_no_charge_commands'
+                            'sequence_version': 'v3.1_reconciliation'
                         }
-                        
+
                         self._log_event(
-                            message="Tesla charging schedules updated with new sequence (no charge start/stop commands)",
+                            message="Tesla charging schedules updated with reconciliation sequence",
                             vehicle_vin=vehicle_vin,
                             extra_data=operation_data
                         )
-                        
-                        return True
+
+                        # FAZA 2: wyrównaj faktyczny stan ładowania z nowym planem
+                        # (auto charge_start w oknie / charge_stop poza oknem — patrz docstring)
+                        self._align_charging_with_plan(resolved_schedules, vehicle_vin, vehicle_status)
+
+                        return removal_success
                     else:
                         logger.error(f"{time_str} ❌ Błąd dodawania nowych harmonogramów")
                         

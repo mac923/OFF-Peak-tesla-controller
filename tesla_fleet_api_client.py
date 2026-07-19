@@ -836,23 +836,66 @@ class TeslaFleetAPIClient:
             console.print(f"[red]❌ Błąd ustawiania limitu ładowania: {e}[/red]")
             return False
     
-    def set_charging_amps(self, vehicle_id: str, charging_amps: int) -> bool:
+    def set_charging_amps(self, vehicle_id: str, charging_amps: int, use_proxy: bool = None) -> bool:
         """Ustawia prąd ładowania"""
         try:
             data = {'charging_amps': charging_amps}
-            self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/set_charging_amps', data)
-            return True
+            # Auto-detect proxy usage jeśli nie podano explicit (jak w set_charge_limit)
+            if use_proxy is None:
+                use_proxy = bool(self.proxy_url)
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/set_charging_amps', data, use_proxy=use_proxy)
+            ok, _ = self._command_result(resp, 'set_charging_amps')
+            return ok
         except Exception as e:
             console.print(f"[red]Błąd ustawiania prądu ładowania: {e}[/red]")
             return False
     
 
     
+    def charge_start(self, vehicle_id: str, use_proxy: bool = None) -> bool:
+        """
+        Rozpoczyna ładowanie (gdy okno harmonogramu pokrywa "teraz",
+        a pojazd czeka zamiast ładować).
+        """
+        try:
+            if use_proxy is None:
+                use_proxy = bool(self.proxy_url)
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/charge_start', use_proxy=use_proxy)
+            ok, reason = self._command_result(resp, 'charge_start')
+            if not ok and 'charging' in reason.lower():
+                # np. reason="is_charging" — pojazd już ładuje = cel osiągnięty
+                console.print(f"[yellow]ℹ️ charge_start: pojazd już ładuje ('{reason}') — traktuję jako sukces[/yellow]")
+                return True
+            return ok
+        except Exception as e:
+            console.print(f"[red]Błąd komendy charge_start: {e}[/red]")
+            return False
+
+    def charge_stop(self, vehicle_id: str, use_proxy: bool = None) -> bool:
+        """
+        Zatrzymuje ładowanie (gdy trwająca sesja wypadła poza okno taniej taryfy
+        po przeliczeniu harmonogramu).
+        """
+        try:
+            if use_proxy is None:
+                use_proxy = bool(self.proxy_url)
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/charge_stop', use_proxy=use_proxy)
+            ok, reason = self._command_result(resp, 'charge_stop')
+            if not ok and 'not_charging' in reason.lower():
+                # Pojazd nie ładuje = cel osiągnięty
+                console.print(f"[yellow]ℹ️ charge_stop: pojazd nie ładuje ('{reason}') — traktuję jako sukces[/yellow]")
+                return True
+            return ok
+        except Exception as e:
+            console.print(f"[red]Błąd komendy charge_stop: {e}[/red]")
+            return False
+
     def charge_max_range(self, vehicle_id: str) -> bool:
         """Ładuje do maksymalnego zasięgu"""
         try:
-            self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/charge_max_range')
-            return True
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/charge_max_range')
+            ok, _ = self._command_result(resp, 'charge_max_range')
+            return ok
         except Exception as e:
             console.print(f"[red]Błąd ustawiania ładowania max range: {e}[/red]")
             return False
