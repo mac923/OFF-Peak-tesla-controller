@@ -19,6 +19,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone, timedelta
+import pytz
 from typing import Dict, Any, Optional, List
 import gspread
 from google.oauth2.service_account import Credentials
@@ -948,15 +949,23 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             
             # KROK 2: Wykonaj scheduled special charging
             result = self._execute_scheduled_special_charging(session_id)
-            
-            # KROK 3: Cleanup dynamiczny scheduler job
-            self._cleanup_dynamic_scheduler_job(session_id)
-            
+
             if result.get('success'):
+                # KROK 3: Usuń send job dopiero PO sukcesie — usunięcie przed
+                # weryfikacją zostawiało sesję SCHEDULED na zawsze przy porażce
+                self._cleanup_dynamic_scheduler_job(session_id)
                 logger.info(f"✅ [SPECIAL] Harmonogram wysłany pomyślnie dla session {session_id}")
                 self._send_response(200, result)
             else:
-                logger.error(f"❌ [SPECIAL] Błąd wysyłania harmonogramu dla session {session_id}")
+                # Zostaw job — retry_config Cloud Schedulera ponowi wywołanie.
+                # Po wyczerpaniu prób oznacz sesję FAILED, żeby nie została zombie.
+                attempts = self._increment_session_send_attempts(session_id)
+                logger.error(f"❌ [SPECIAL] Błąd wysyłania harmonogramu dla session {session_id} "
+                             f"(próba {attempts})")
+                if attempts >= 4:  # 1 oryginalna + 3 retry
+                    logger.error(f"🚨 [SPECIAL] ALERT: wyczerpane próby dla {session_id} — oznaczam FAILED")
+                    self._mark_session_failed(session_id, result.get('error', 'unknown'))
+                    self._cleanup_dynamic_scheduler_job(session_id)
                 self._send_response(500, result)
                 
         except Exception as e:
@@ -1226,12 +1235,18 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                     "oidc_token": {
                         "service_account_email": f"{PROJECT_ID}@appspot.gserviceaccount.com"
                     }
+                },
+                # Retry na wypadek przejściowego błędu Workera (cold start, timeout) —
+                # cron bez retry odpala się dokładnie raz i sesja przepada
+                "retry_config": {
+                    "retry_count": 3,
+                    "max_retry_duration": {"seconds": 900}
                 }
             }
-            
+
             # Utwórz job
             client.create_job(parent=PROJECT_LOCATION, job=job)
-            
+
             logger.info(f"✅ [SPECIAL] Dynamic scheduler job utworzony: {job_name}")
             return True
             
@@ -1299,12 +1314,17 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                     "oidc_token": {
                         "service_account_email": f"{PROJECT_ID}@appspot.gserviceaccount.com"
                     }
+                },
+                # Retry — nieudany cleanup zostawia podniesiony charge_limit
+                "retry_config": {
+                    "retry_count": 3,
+                    "max_retry_duration": {"seconds": 900}
                 }
             }
-            
+
             # Utwórz job
             client.create_job(parent=PROJECT_LOCATION, job=job)
-            
+
             logger.info(f"✅ [SPECIAL] One-shot cleanup job utworzony: {job_name}")
             return True
             
@@ -1414,25 +1434,42 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                 tesla_schedule = self._convert_charging_plan_to_tesla_schedule(charging_plan)
                 
                 # KROK 5: Wyślij harmonogram do Tesla (używa Tesla HTTP Proxy)
-                if not self._send_tesla_charging_schedule(vin, tesla_schedule):
+                sent_schedule_ids = self._send_tesla_charging_schedule(vin, tesla_schedule)
+                if sent_schedule_ids is None:
                     logger.error(f"❌ [SPECIAL] Nie udało się wysłać harmonogramu do Tesla")
                     return False
                 
                 # KROK 6: Zapisz special charging session
+                session_id = self._session_id_for_need(need) or f"special_{need.get('row', '0')}_unknown"
+
+                # NAPRAWKA: original_charge_limit zapisujemy RAZ. Przy ponownym wysłaniu
+                # (retry, drugi daily check) limit w aucie jest już podniesiony —
+                # nadpisanie utrwaliłoby np. 100% jako "oryginał".
+                existing_session = self._get_special_charging_session(session_id)
+                if existing_session and existing_session.get('original_charge_limit') is not None:
+                    original_limit_to_save = existing_session['original_charge_limit']
+                    logger.info(f"📊 [SPECIAL] Zachowuję wcześniejszy original_charge_limit: {original_limit_to_save}%")
+                else:
+                    original_limit_to_save = current_charge_limit
+
+                target_dt = need.get('target_datetime')
+                target_dt_iso = target_dt.isoformat() if hasattr(target_dt, 'isoformat') else str(target_dt)
+
                 session_data = {
-                    'session_id': f"special_{need['row']}_{need['target_datetime'].strftime('%Y%m%d_%H%M')}",
+                    'session_id': session_id,
                     'vin': vin,
                     'status': 'ACTIVE',
                     'target_battery_level': target_battery_percent,
-                    'target_datetime': need['target_datetime'].isoformat(),
+                    'target_datetime': target_dt_iso,
                     'charging_start': charging_plan['charging_start'].isoformat(),
                     'charging_end': charging_plan['charging_end'].isoformat(),
-                    'original_charge_limit': current_charge_limit,
-                    'sheets_row': need['row'],
+                    'original_charge_limit': original_limit_to_save,
+                    'sheets_row': need.get('row'),
                     'created_at': self.monitor._get_warsaw_time().isoformat(),
-                    'charging_plan': charging_plan
+                    'charging_plan': charging_plan,
+                    'tesla_schedule_ids': sent_schedule_ids
                 }
-                
+
                 if not self._create_special_charging_session(session_data):
                     logger.warning(f"⚠️ [SPECIAL] Nie udało się zapisać session, ale harmonogram wysłany")
                 
@@ -1501,10 +1538,11 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
         Konwertuje plan ładowania na format Tesla charging schedules
         """
         try:
-            # Pobierz współrzędne HOME z .env (analogicznie do warunku A)
-            home_lat = float(os.getenv('HOME_LATITUDE', '0.0'))
-            home_lon = float(os.getenv('HOME_LONGITUDE', '0.0'))
-            
+            # Pobierz współrzędne HOME z .env — te same domyślne co monitor
+            # (0.0/0.0 tworzyło harmonogram "na równiku", poza logiką HOME)
+            home_lat = float(os.getenv('HOME_LATITUDE', '52.334215'))
+            home_lon = float(os.getenv('HOME_LONGITUDE', '20.937516'))
+
             schedules = []
             for sched in charging_plan.get('schedules', []):
                 start_time = sched.get('start_time', '00:00')
@@ -1541,15 +1579,23 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             logger.error(f"❌ [SPECIAL] Błąd konwersji planu ładowania: {e}")
             return []
     
-    def _send_tesla_charging_schedule(self, vin: str, schedule: List[Dict[str, Any]]) -> bool:
+    def _send_tesla_charging_schedule(self, vin: str, schedule: List[Dict[str, Any]]) -> Optional[List[int]]:
         """
-        Wysyła harmonogram ładowania do pojazdu Tesla z prawidłowymi współrzędnymi
+        Wysyła harmonogram ładowania do pojazdu Tesla z prawidłowymi współrzędnymi.
+
+        Returns:
+            List[int]: ID dodanych harmonogramów (read-after-write; API nie zwraca ID
+                       w odpowiedzi add) — zapisywane w sesji, żeby cleanup i zwykły
+                       cykl wiedziały, które okna należą do special charging.
+            None: porażka wysyłki.
         """
         try:
             # Pobierz współrzędne HOME z .env (analogicznie do warunku A)
-            home_lat = float(os.getenv('HOME_LATITUDE', '0.0'))
-            home_lon = float(os.getenv('HOME_LONGITUDE', '0.0'))
-            
+            # UWAGA: te same domyślne co monitor — wcześniejsze (0.0, 0.0) tworzyło
+            # harmonogram "na równiku", niewidoczny dla logiki HOME
+            home_lat = float(os.getenv('HOME_LATITUDE', '52.334215'))
+            home_lon = float(os.getenv('HOME_LONGITUDE', '20.937516'))
+
             # Konwertuj na ChargeSchedule obiekty
             charge_schedules = []
             for sched in schedule:
@@ -1561,39 +1607,55 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                     end_enabled=True,  # NAPRAWKA: kończyć ładowanie o określonym czasie
                     lat=home_lat,
                     lon=home_lon,
-                    days_of_week="All"
+                    days_of_week="All",
+                    one_time=True  # sesja jednorazowa nie może powtarzać się codziennie
                 )
                 charge_schedules.append(charge_schedule)
-            
+
             # Rozwiąż nakładania przed wysłaniem
             logger.info(f"🔍 [SPECIAL] Sprawdzanie nakładań w {len(charge_schedules)} harmonogramach...")
             resolved_schedules = self.monitor._resolve_schedule_overlaps(charge_schedules, vin)
-            
+
+            # Read-after-write: zbiór ID przed dodaniem
+            before = self.monitor._get_home_schedules_from_tesla(vin)
+            before_ids = {s.get('id') for s in before} if before else set()
+
             logger.info(f"📋 [SPECIAL] Wysyłanie {len(resolved_schedules)} harmonogramów (po usunięciu nakładań)")
-            
+
             # Wysyłaj rozwiązane harmonogramy
             for i, schedule_obj in enumerate(resolved_schedules):
                 start_minutes = schedule_obj.start_time
                 end_minutes = schedule_obj.end_time
-                
-                logger.info(f"📋 [SPECIAL] Harmonogram {i+1}: {start_minutes//60:02d}:{start_minutes%60:02d}-{end_minutes//60:02d}:{end_minutes%60:02d}, enabled=True, lat={home_lat}, lon={home_lon}")
-                
+
+                logger.info(f"📋 [SPECIAL] Harmonogram {i+1}: {start_minutes//60:02d}:{start_minutes%60:02d}-{end_minutes//60:02d}:{end_minutes%60:02d}, enabled=True, one_time=True, lat={home_lat}, lon={home_lon}")
+
                 # Dodaj harmonogram do pojazdu
                 success = self.monitor.tesla_controller.add_charge_schedule(schedule_obj)
                 if not success:
                     logger.error(f"❌ [SPECIAL] Nie udało się dodać harmonogramu {i+1}")
-                    return False
-                    
+                    return None
+
                 # Opóźnienie między harmonogramami (jak w warunku A)
                 if i < len(resolved_schedules) - 1:
                     time.sleep(3)
-            
+
+            # Read-after-write: nowe ID = po dodaniu minus przed dodaniem
+            time.sleep(2)
+            after = self.monitor._get_home_schedules_from_tesla(vin)
+            if after is None:
+                logger.warning(f"⚠️ [SPECIAL] Nie udało się odczytać ID dodanych harmonogramów (kontynuuję bez ID)")
+                sent_ids = []
+            else:
+                sent_ids = [s.get('id') for s in after
+                            if s.get('id') is not None and s.get('id') not in before_ids]
+                logger.info(f"📋 [SPECIAL] ID dodanych harmonogramów special: {sent_ids}")
+
             logger.info(f"✅ [SPECIAL] Wszystkie harmonogramy wysłane pomyślnie")
-            return True
-            
+            return sent_ids
+
         except Exception as e:
             logger.error(f"❌ [SPECIAL] Błąd wysyłania harmonogramów: {e}")
-            return False
+            return None
     
     def _time_str_to_minutes(self, time_str: str) -> int:
         """Konwertuje string czasu 'HH:MM' na minuty od północy"""
@@ -1635,38 +1697,108 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             logger.error(f"❌ [SPECIAL] Błąd tworzenia session: {e}")
             return False
 
+    def _increment_session_send_attempts(self, session_id: str) -> int:
+        """Zlicza nieudane próby wysłania harmonogramu sesji (dla limitu retry)."""
+        try:
+            db = self.monitor._get_firestore_client()
+            doc_ref = db.collection('special_charging_sessions').document(session_id)
+            doc = doc_ref.get()
+            attempts = ((doc.to_dict() or {}).get('send_attempts', 0) if doc.exists else 0) + 1
+            doc_ref.update({'send_attempts': attempts})
+            return attempts
+        except Exception as e:
+            logger.warning(f"⚠️ [SPECIAL] Błąd zliczania prób dla {session_id}: {e}")
+            return 1
+
+    def _mark_session_failed(self, session_id: str, error: str):
+        """Oznacza sesję jako FAILED (daily check może ją ponownie zaplanować)."""
+        try:
+            db = self.monitor._get_firestore_client()
+            db.collection('special_charging_sessions').document(session_id).update({
+                'status': 'FAILED',
+                'failed_at': self.monitor._get_warsaw_time().isoformat(),
+                'failure_reason': error
+            })
+        except Exception as e:
+            logger.error(f"❌ [SPECIAL] Nie można oznaczyć sesji {session_id} jako FAILED: {e}")
+
     def _complete_special_charging_session(self, session_data: Dict[str, Any]) -> bool:
-        """Kończy special charging session i przywraca oryginalne ustawienia"""
+        """
+        Kończy special charging session: przywraca oryginalny charge limit
+        i usuwa harmonogramy sesji z pojazdu (po zapisanych tesla_schedule_ids).
+        Uruchamia Tesla HTTP Proxy on-demand — cleanup wykonuje się w świeżej
+        instancji, w której proxy nie działa.
+        """
         try:
             session_id = session_data.get('session_id', 'unknown')
             vin = session_data.get('vin', 'unknown')
             original_limit = session_data.get('original_charge_limit', 80)
-            
+            schedule_ids = session_data.get('tesla_schedule_ids') or []
+
             logger.info(f"🏁 [SPECIAL] Kończę session {session_id} dla {vin[-4:]}")
-            
+
             # Sprawdź obecny poziom baterii
             current_vehicle_data = self._get_current_vehicle_data()
             current_battery = current_vehicle_data.get('battery_level', 0) if current_vehicle_data else 0
-            
-            # Przywróć oryginalny charge limit jeśli potrzeba
-            current_limit = self._get_current_charge_limit(vin)
-            if current_limit and current_limit != original_limit:
-                logger.info(f"🔧 [SPECIAL] Przywracam oryginalny limit: {current_limit}% → {original_limit}%")
-                self._set_charge_limit(vin, original_limit)
-                time.sleep(3)
-            
+
+            # Proxy on-demand dla komend (set_charge_limit / remove_charge_schedule)
+            proxy_started = False
+            smart_proxy_mode = os.getenv('TESLA_SMART_PROXY_MODE') == 'true'
+            proxy_available = os.getenv('TESLA_PROXY_AVAILABLE') == 'true'
+            if smart_proxy_mode and proxy_available:
+                proxy_started = self.monitor._start_proxy_on_demand()
+                if proxy_started and hasattr(self.monitor.tesla_controller.fleet_api, 'proxy_url'):
+                    proxy_host = os.getenv('TESLA_HTTP_PROXY_HOST', 'localhost')
+                    proxy_port = os.getenv('TESLA_HTTP_PROXY_PORT', '4443')
+                    self.monitor.tesla_controller.fleet_api.proxy_url = f"https://{proxy_host}:{proxy_port}"
+
+            restore_ok = True
+            removal_ok = True
+            try:
+                # Przywróć oryginalny charge limit jeśli potrzeba
+                current_limit = self._get_current_charge_limit(vin)
+                if current_limit and current_limit != original_limit:
+                    logger.info(f"🔧 [SPECIAL] Przywracam oryginalny limit: {current_limit}% → {original_limit}%")
+                    restore_ok = self._set_charge_limit(vin, original_limit)
+                    time.sleep(3)
+
+                # Usuń harmonogramy sesji z pojazdu — one_time po wykonaniu znika sam
+                # (wtedy remove dostaje not_found = sukces), ale sesja przerwana/anulowana
+                # zostawiłaby okno w aucie
+                for schedule_id in schedule_ids:
+                    logger.info(f"🗑️ [SPECIAL] Usuwam harmonogram sesji ID={schedule_id}")
+                    if not self.monitor.tesla_controller.remove_charge_schedule(schedule_id, skip_wake=True):
+                        removal_ok = False
+                        logger.error(f"❌ [SPECIAL] Nie udało się usunąć harmonogramu ID={schedule_id}")
+            finally:
+                if proxy_started and hasattr(self.monitor, '_stop_proxy'):
+                    try:
+                        self.monitor._stop_proxy()
+                    except Exception as stop_error:
+                        logger.warning(f"⚠️ [SPECIAL] Błąd zatrzymywania proxy: {stop_error}")
+
+            if not restore_ok:
+                logger.error(f"🚨 [SPECIAL] ALERT: nie przywrócono charge limit {original_limit}% dla {vin[-4:]}")
+                # NIE oznaczaj COMPLETED — retry cleanup joba spróbuje ponownie
+                return False
+
             # Aktualizuj status session w Firestore
             db = self.monitor._get_firestore_client()
             doc_ref = db.collection('special_charging_sessions').document(session_id)
             doc_ref.update({
                 'status': 'COMPLETED',
                 'completed_at': self.monitor._get_warsaw_time().isoformat(),
-                'final_battery_level': current_battery
+                'final_battery_level': current_battery,
+                'schedules_removed': removal_ok
             })
-            
+
+            if not removal_ok:
+                logger.warning(f"⚠️ [SPECIAL] Session COMPLETED, ale nie wszystkie harmonogramy usunięte "
+                               f"(zwykły cykl wymiecie je przy rekoncyliacji)")
+
             logger.info(f"✅ [SPECIAL] Session {session_id} zakończony (bateria: {current_battery}%)")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ [SPECIAL] Błąd completion session: {e}")
             return False
@@ -1705,22 +1837,20 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             
             # NOWA LOGIKA: Inteligentne pobieranie battery_level
             battery_level = vehicle_data.get('battery_level', None)
-            
-            if battery_level is None and not is_online:
-                # Pojazd offline - spróbuj pobrać ostatnią znaną wartość z Firestore
-                logger.info(f"🔋 [SPECIAL] Pojazd offline, pobieranie ostatniego znanego poziomu baterii...")
+
+            if battery_level is None:
+                # Pojazd offline/brak danych — użyj ostatniej znanej wartości (max 24h),
+                # ale NIGDY nie zmyślaj (poprzednie domyślne 50% dawało plan ładowania
+                # oderwany od rzeczywistości: za krótki przy 20%, zbędny przy 80%)
+                logger.info(f"🔋 [SPECIAL] Brak bieżących danych baterii, sprawdzam ostatnią znaną wartość...")
                 last_known_battery = self._get_last_known_battery_level(vin)
-                
+
                 if last_known_battery is not None:
                     battery_level = last_known_battery
                     logger.info(f"📚 [SPECIAL] Użyto ostatniej znanej wartości baterii: {battery_level}%")
                 else:
-                    # Brak danych historycznych - użyj rozsądnej wartości domyślnej
-                    battery_level = 50  # Zamiast 0% użyj 50% jako rozumnej wartości domyślnej
-                    logger.warning(f"⚠️ [SPECIAL] Brak danych baterii, używam wartości domyślnej: {battery_level}%")
-            elif battery_level is None:
-                battery_level = 50  # Fallback dla innych przypadków
-                logger.warning(f"⚠️ [SPECIAL] Brak battery_level, używam wartości domyślnej: {battery_level}%")
+                    logger.error(f"🚨 [SPECIAL] Brak wiarygodnych danych baterii (bieżących i historycznych <24h) "
+                                 f"— battery_level=None, wołający musi obsłużyć")
             else:
                 logger.info(f"🔋 [SPECIAL] Aktualny poziom baterii: {battery_level}%")
             
@@ -1740,23 +1870,42 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             return None
     
     def _get_last_known_battery_level(self, vin: str) -> Optional[int]:
-        """Pobiera ostatnią znaną wartość battery_level z Firestore"""
+        """Pobiera ostatnią znaną wartość battery_level z Firestore (max 24h wstecz)."""
         try:
             firestore_client = self.monitor._get_firestore_client()
-            
+
             # Sprawdź ostatni dokument ze statusem pojazdu
             collection_name = f"vehicle_status_{vin[-4:]}"
             query = firestore_client.collection(collection_name).order_by('timestamp', direction='DESCENDING').limit(10)
             docs = list(query.stream())
-            
+
+            max_age = timedelta(hours=24)
+            now = self.monitor._get_warsaw_time()
+
             for doc in docs:
                 data = doc.to_dict()
                 battery_level = data.get('battery_level')
-                if battery_level is not None and battery_level > 0:
-                    logger.info(f"📚 [SPECIAL] Znaleziono ostatnią wartość baterii w Firestore: {battery_level}% z {data.get('timestamp', 'brak_czasu')}")
-                    return int(battery_level)
-            
-            logger.info(f"📚 [SPECIAL] Nie znaleziono historycznych danych baterii w Firestore")
+                if battery_level is None or battery_level <= 0:
+                    continue
+
+                # Odrzuć wpisy starsze niż 24h — bateria mogła się od tego czasu
+                # istotnie zmienić (jazda/ładowanie), plan liczony od nich to fikcja
+                ts = data.get('timestamp')
+                try:
+                    ts_dt = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+                    if ts_dt.tzinfo is None:
+                        ts_dt = pytz.timezone('Europe/Warsaw').localize(ts_dt)
+                    if now - ts_dt > max_age:
+                        logger.info(f"📚 [SPECIAL] Wpis baterii z {ts} starszy niż 24h - pomijam")
+                        continue
+                except (ValueError, TypeError):
+                    logger.info(f"📚 [SPECIAL] Wpis baterii bez parsowalnego czasu ({ts}) - pomijam")
+                    continue
+
+                logger.info(f"📚 [SPECIAL] Znaleziono ostatnią wartość baterii w Firestore: {battery_level}% z {ts}")
+                return int(battery_level)
+
+            logger.info(f"📚 [SPECIAL] Brak historycznych danych baterii młodszych niż 24h")
             return None
             
         except Exception as e:
@@ -1834,7 +1983,15 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                     logger.error(f"❌ [SPECIAL] {error_msg}")
                     result["errors"].append(error_msg)
                     return result
-                    
+
+                if vehicle_data.get('battery_level') is None:
+                    # Bez wiarygodnego poziomu baterii nie liczymy planu (fikcyjny plan
+                    # jest gorszy niż brak planu — kolejny check/send-time ponowi z realnymi danymi)
+                    error_msg = "Brak wiarygodnych danych baterii (<24h) - pomijam planowanie special charging"
+                    logger.error(f"🚨 [SPECIAL] ALERT: {error_msg}")
+                    result["errors"].append(error_msg)
+                    return result
+
                 logger.info(f"{time_str} 🔋 [SPECIAL] Aktualny poziom baterii: {vehicle_data.get('battery_level', 'unknown')}%")
                 
             except Exception as e:
@@ -1846,8 +2003,19 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             # KROK 3: Przetwórz każdą potrzebę ładowania
             for need in special_needs:
                 try:
+                    # DEDUPLIKACJA: need z istniejącą sesją SCHEDULED/ACTIVE pomijamy —
+                    # bez tego ten sam wiersz był przetwarzany każdej nocy od nowa
+                    # (m.in. nadpisując original_charge_limit już podniesioną wartością)
+                    dedup_session_id = self._session_id_for_need(need)
+                    if dedup_session_id:
+                        existing_session = self._get_special_charging_session(dedup_session_id)
+                        if existing_session and existing_session.get('status') in ('SCHEDULED', 'ACTIVE'):
+                            logger.info(f"{time_str} ⏭️ [SPECIAL] Need {need.get('row', '?')} ma już sesję "
+                                        f"{dedup_session_id} ({existing_session.get('status')}) - pomijam")
+                            continue
+
                     result["processed_needs"] += 1
-                    
+
                     # Oblicz plan ładowania
                     charging_plan = self._calculate_charging_plan(need, vehicle_data)
                     if not charging_plan:
@@ -1863,10 +2031,19 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                     if send_time and current_time >= send_time:
                         # Wyślij harmonogram teraz
                         logger.info(f"{time_str} ⏰ [SPECIAL] Czas wysłać harmonogram dla need {need.get('row', 'unknown')}")
-                        
+
                         if self._send_special_charging_schedule(charging_plan, need, vehicle_data):
                             result["sent_schedules"] += 1
                             logger.info(f"✅ [SPECIAL] Harmonogram wysłany pomyślnie")
+
+                            # Cleanup job także dla ścieżki natychmiastowej — sesja ACTIVE
+                            # bez cleanup joba zostawia podniesiony charge_limit na zawsze
+                            immediate_session_id = self._session_id_for_need(need)
+                            if immediate_session_id and self._create_cleanup_dynamic_scheduler_job(charging_plan, immediate_session_id):
+                                logger.info(f"✅ [SPECIAL] One-shot cleanup job utworzony dla {immediate_session_id}")
+                            else:
+                                logger.error(f"🚨 [SPECIAL] ALERT: brak cleanup job dla sesji natychmiastowej — "
+                                             f"charge_limit nie zostanie przywrócony automatycznie!")
                         else:
                             logger.error(f"❌ [SPECIAL] Nie udało się wysłać harmonogramu")
                             result["errors"].append(f"Błąd wysyłania harmonogramu dla need {need.get('row', 'unknown')}")
@@ -1894,12 +2071,21 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                         
                         if self._create_special_charging_session(session_data):
                             result["created_sessions"] += 1
-                            
-                            # Utwórz dynamic scheduler job
+
+                            # Utwórz dynamic scheduler job (send o send_schedule_at)
                             if self._create_dynamic_scheduler_job(charging_plan, session_id):
                                 logger.info(f"✅ [SPECIAL] Session i dynamic job utworzone dla {session_id}")
                             else:
                                 logger.warning(f"⚠️ [SPECIAL] Session utworzony ale błąd dynamic job dla {session_id}")
+
+                            # NAPRAWA KRYTYCZNA: one-shot cleanup job (charging_end + 30 min).
+                            # Funkcja istniała, ale NIGDY nie była wywoływana — podniesiony
+                            # charge_limit nie wracał do normy po żadnej sesji.
+                            if self._create_cleanup_dynamic_scheduler_job(charging_plan, session_id):
+                                logger.info(f"✅ [SPECIAL] One-shot cleanup job utworzony dla {session_id}")
+                            else:
+                                logger.error(f"🚨 [SPECIAL] ALERT: brak cleanup job dla {session_id} — "
+                                             f"charge_limit nie zostanie przywrócony automatycznie!")
                         else:
                             logger.error(f"❌ [SPECIAL] Błąd tworzenia session {session_id}")
                     
@@ -1925,6 +2111,27 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                 "created_sessions": 0,
                 "errors": [error_msg]
             }
+
+    def _session_id_for_need(self, need: Dict[str, Any]) -> Optional[str]:
+        """
+        Deterministyczny session_id dla need z Google Sheets:
+        special_{row}_{YYYYmmdd_HHMM}. Obsługuje target_datetime jako datetime
+        lub string (fallback po nieudanym parsowaniu).
+        """
+        try:
+            target = need.get('target_datetime')
+            if hasattr(target, 'strftime'):
+                stamp = target.strftime('%Y%m%d_%H%M')
+            else:
+                # String — znormalizuj do cyfr (np. "2026-07-22T07:00:00" → 20260722_0700)
+                digits = ''.join(ch for ch in str(target) if ch.isdigit())
+                if len(digits) < 12:
+                    return None
+                stamp = f"{digits[:8]}_{digits[8:12]}"
+            return f"special_{need.get('row', '0')}_{stamp}"
+        except Exception as e:
+            logger.warning(f"⚠️ [SPECIAL] Nie można zbudować session_id dla need: {e}")
+            return None
 
     def _get_special_charging_needs_from_sheets(self) -> List[Dict[str, Any]]:
         """Pobiera special charging needs z Google Sheets"""

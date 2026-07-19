@@ -926,8 +926,11 @@ def _check_active_special_charging_session(vin: str) -> bool:
                         
                         if hours_since_end > 2:  # 2h buffer
                             logger.warning(f"⚠️ [SCOUT] ZOMBIE SESSION: {session_id} powinna być COMPLETED!")
-                            logger.warning(f"⚠️ [SCOUT] Zakończone {hours_since_end:.1f}h temu - wymaga czyszczenia przez Worker")
+                            logger.warning(f"⚠️ [SCOUT] Zakończone {hours_since_end:.1f}h temu - zlecam cleanup Workerowi")
                             print(f"⚠️ [SCOUT] ZOMBIE SESSION: {session_id} - zakończone {hours_since_end:.1f}h temu!")
+                            # SELF-HEAL: bez tego zombie blokowała Warunek A bezterminowo
+                            # (ten tick jeszcze blokuje; po cleanup kolejne ticki działają normalnie)
+                            _trigger_zombie_session_cleanup(session_id)
                         else:
                             logger.info(f"✅ [SCOUT] Session {session_id} prawidłowo aktywna")
                             
@@ -966,6 +969,39 @@ def _check_active_special_charging_session(vin: str) -> bool:
     except Exception as e:
         logger.warning(f"⚠️ [SCOUT] Błąd sprawdzania special charging sessions: {e}")
         return False  # W przypadku błędu nie blokuj normalnego działania
+
+def _trigger_zombie_session_cleanup(session_id: str) -> bool:
+    """
+    SELF-HEAL: zleca Workerowi domknięcie sesji zombie (/cleanup-single-session).
+    Wcześniej Scout tylko logował ostrzeżenie i blokował Warunek A bezterminowo —
+    auto nie dostawało harmonogramu żadnej kolejnej nocy.
+    """
+    try:
+        worker_url = os.environ.get('WORKER_SERVICE_URL')
+        if not worker_url:
+            logger.error("❌ [SCOUT] Brak WORKER_SERVICE_URL - nie mogę zlecić cleanup zombie")
+            return False
+
+        headers = {'Content-Type': 'application/json'}
+        token = get_google_cloud_identity_token(worker_url)
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+
+        response = requests.post(
+            f"{worker_url}/cleanup-single-session",
+            json={'session_id': session_id, 'trigger': 'scout_zombie_self_heal',
+                  'action': 'cleanup_single_special_session'},
+            headers=headers,
+            timeout=45
+        )
+        if response.status_code == 200:
+            logger.info(f"✅ [SCOUT] Worker domknął sesję zombie {session_id}")
+            return True
+        logger.error(f"❌ [SCOUT] Worker cleanup zombie {session_id}: HTTP {response.status_code}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ [SCOUT] Błąd zlecania cleanup zombie {session_id}: {e}")
+        return False
 
 def get_last_known_state(db: firestore.Client, vin: str) -> Optional[Dict[str, Any]]:
     """Pobiera ostatni znany stan pojazdu z Firestore"""
