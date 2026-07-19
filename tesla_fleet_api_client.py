@@ -729,8 +729,32 @@ class TeslaFleetAPIClient:
             console.print(f"[red]💥 Nieoczekiwany błąd żądania: {e}[/red]")
             raise Exception(f"Błąd żądania: {e}")
     
+    # Wzorce "reason" przy result=false oznaczające stan już osiągnięty (idempotencja)
+    _ALREADY_SATISFIED_REASONS = ('not_found', 'not found', 'does not exist', 'no such schedule')
+
+    def _command_result(self, response: Dict, command_name: str) -> tuple:
+        """
+        Odczytuje faktyczny wynik komendy /command/* z odpowiedzi Fleet API.
+        Tesla zwraca HTTP 200 z {"response": {"result": false, "reason": "..."}}
+        gdy pojazd odrzuci komendę — sam status HTTP nie oznacza sukcesu.
+        UWAGA: nie dotyczy wake_up, który nie zwraca pola result.
+
+        Returns:
+            (success: bool, reason: str)
+        """
+        inner = response.get('response') if isinstance(response, dict) else None
+        if not isinstance(inner, dict) or 'result' not in inner:
+            # Nieznany kształt odpowiedzi — nie blokuj, ale zostaw wyraźny ślad
+            console.print(f"[yellow]⚠️ {command_name}: odpowiedź bez pola result — przyjmuję sukces: {str(response)[:200]}[/yellow]")
+            return True, ''
+        reason = str(inner.get('reason') or '')
+        if inner.get('result') is True:
+            return True, reason
+        console.print(f"[red]❌ {command_name}: pojazd odrzucił komendę (result=false, reason='{reason}')[/red]")
+        return False, reason
+
     # ========== PODSTAWOWE OPERACJE ==========
-    
+
     def get_vehicles(self) -> List[Dict]:
         """Pobiera listę pojazdów z obsługą błędów autoryzacji"""
         try:
@@ -798,8 +822,9 @@ class TeslaFleetAPIClient:
             else:
                 console.print(f"[yellow]⚠️ set_charge_limit przez Fleet API (może być odrzucony bez podpisu)[/yellow]")
             
-            self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/set_charge_limit', data, use_proxy=use_proxy)
-            return True
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/set_charge_limit', data, use_proxy=use_proxy)
+            ok, _ = self._command_result(resp, 'set_charge_limit')
+            return ok
         except TeslaAuthenticationError as e:
             if e.needs_reauthorization():
                 console.print("[yellow]💡 Wymagana ponowna autoryzacja - uruchom: python3 generate_token.py[/yellow]")
@@ -835,8 +860,9 @@ class TeslaFleetAPIClient:
     def charge_standard(self, vehicle_id: str) -> bool:
         """Ładuje w trybie standardowym"""
         try:
-            self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/charge_standard')
-            return True
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/charge_standard')
+            ok, _ = self._command_result(resp, 'charge_standard')
+            return ok
         except Exception as e:
             console.print(f"[red]Błąd ustawiania ładowania standard: {e}[/red]")
             return False
@@ -844,8 +870,9 @@ class TeslaFleetAPIClient:
     def charge_port_door_open(self, vehicle_id: str) -> bool:
         """Otwiera klapę portu ładowania"""
         try:
-            self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/charge_port_door_open')
-            return True
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/charge_port_door_open')
+            ok, _ = self._command_result(resp, 'charge_port_door_open')
+            return ok
         except Exception as e:
             console.print(f"[red]Błąd otwierania klapy ładowania: {e}[/red]")
             return False
@@ -853,8 +880,9 @@ class TeslaFleetAPIClient:
     def charge_port_door_close(self, vehicle_id: str) -> bool:
         """Zamyka klapę portu ładowania"""
         try:
-            self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/charge_port_door_close')
-            return True
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/charge_port_door_close')
+            ok, _ = self._command_result(resp, 'charge_port_door_close')
+            return ok
         except Exception as e:
             console.print(f"[red]Błąd zamykania klapy ładowania: {e}[/red]")
             return False
@@ -867,8 +895,9 @@ class TeslaFleetAPIClient:
             data = {'enable': enable}
             if time is not None:
                 data['time'] = time
-            self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/set_scheduled_charging', data)
-            return True
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/set_scheduled_charging', data)
+            ok, _ = self._command_result(resp, 'set_scheduled_charging')
+            return ok
         except Exception as e:
             console.print(f"[red]Błąd ustawiania zaplanowanego ładowania: {e}[/red]")
             return False
@@ -930,8 +959,9 @@ class TeslaFleetAPIClient:
             else:
                 console.print(f"[yellow]⚠️ add_charge_schedule przez Fleet API (może być odrzucony bez podpisu)[/yellow]")
 
-            self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/add_charge_schedule', data, use_proxy=use_proxy)
-            return True
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/add_charge_schedule', data, use_proxy=use_proxy)
+            ok, _ = self._command_result(resp, 'add_charge_schedule')
+            return ok
         except Exception as e:
             console.print(f"[red]Błąd dodawania harmonogramu ładowania: {e}[/red]")
             return False
@@ -949,18 +979,25 @@ class TeslaFleetAPIClient:
                 console.print("[yellow]OSTRZEŻENIE: remove_charge_schedule wymaga proxy. Wymuszono użycie proxy.[/yellow]")
                 use_proxy = True
                 
-            self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/remove_charge_schedule', data, use_proxy=use_proxy)
-            return True
+            resp = self._make_signed_request('POST', f'/api/1/vehicles/{vehicle_id}/command/remove_charge_schedule', data, use_proxy=use_proxy)
+            ok, reason = self._command_result(resp, 'remove_charge_schedule')
+            if not ok and any(p in reason.lower() for p in self._ALREADY_SATISFIED_REASONS):
+                # Harmonogram już nie istnieje (np. wykonany one_time) — cel osiągnięty
+                console.print(f"[yellow]ℹ️ remove_charge_schedule: harmonogram {schedule_id} już nie istnieje — traktuję jako sukces[/yellow]")
+                return True
+            return ok
         except Exception as e:
             console.print(f"[red]Błąd usuwania harmonogramu ładowania: {e}[/red]")
             return False
     
-    def get_charge_schedules(self, vehicle_id: str) -> List[Dict]:
+    def get_charge_schedules(self, vehicle_id: str) -> Optional[List[Dict]]:
         """
         Pobiera istniejące harmonogramy ładowania z dużą odpornością na zmiany w API
-        
+
         Returns:
-            List[Dict]: Lista harmonogramów ładowania
+            List[Dict]: Lista harmonogramów ładowania ([] gdy potwierdzono brak)
+            None: Gdy odczyt się nie powiódł — NIE oznacza "brak harmonogramów"!
+                  Wołający nie może na tej podstawie pomijać usuwania starych wpisów.
         """
         try:
             # Krok 1: Zgodnie z dokumentacją Tesla API, harmonogramy są w konkretnych endpointach
@@ -977,8 +1014,8 @@ class TeslaFleetAPIClient:
             vehicle_data = self.get_vehicle_data(vehicle_id, endpoints=endpoints_to_query) 
             
             if not vehicle_data:
-                console.print("[yellow]Nie udało się pobrać danych pojazdu.[/yellow]")
-                return []
+                console.print("[yellow]Nie udało się pobrać danych pojazdu — błąd odczytu (None), nie pusta lista.[/yellow]")
+                return None
 
             # Krok 2: Zgodnie z dokumentacją Tesla API, sprawdź dokładnie wskazane endpointy
             console.print(f"🔍 Sprawdzanie struktury odpowiedzi vehicle_data...")
@@ -1006,23 +1043,13 @@ class TeslaFleetAPIClient:
                     console.print(f"✅ Znaleziono {len(charge_schedule_data)} harmonogramów w charge_schedule_data (lista)")
                     return charge_schedule_data
             
-            # Krok 2b: Sprawdź endpoint dla harmonogramów preconditioning
-            preconditioning_schedule_data = vehicle_data.get('preconditioning_schedule_data')
-            if preconditioning_schedule_data is not None:
-                console.print(f"✅ Znaleziono preconditioning_schedule_data: {type(preconditioning_schedule_data)}")
-                console.print(f"📋 Klucze w preconditioning_schedule_data: {list(preconditioning_schedule_data.keys()) if isinstance(preconditioning_schedule_data, dict) else 'nie jest dict'}")
-                
-                # Sprawdź czy zawiera harmonogramy preconditioning
-                if isinstance(preconditioning_schedule_data, dict):
-                    if 'preconditioning_schedules' in preconditioning_schedule_data:
-                        schedules = preconditioning_schedule_data['preconditioning_schedules']
-                        if isinstance(schedules, list) and schedules:
-                            console.print(f"✅ Znaleziono {len(schedules)} harmonogramów preconditioning")
-                            return schedules
-                elif isinstance(preconditioning_schedule_data, list) and preconditioning_schedule_data:
-                    console.print(f"✅ Znaleziono {len(preconditioning_schedule_data)} harmonogramów preconditioning (lista)")
-                    return preconditioning_schedule_data
-            
+            # UWAGA: preconditioning_schedule_data celowo NIE jest zwracane —
+            # to harmonogramy podgrzewania, nie ładowania. Wcześniejszy fallback
+            # zwracał je jako charge schedules, przez co remove_all mógł kasować
+            # użytkownikowi preconditioning i nie usuwać realnych okien ładowania.
+            if vehicle_data.get('preconditioning_schedule_data') is not None:
+                console.print("[blue]ℹ️ Pominięto preconditioning_schedule_data (to nie są harmonogramy ładowania)[/blue]")
+
             # Krok 2c: Sprawdź czy harmonogramy nie są w charge_state (fallback)
             charge_state = vehicle_data.get('charge_state', {})
             if isinstance(charge_state, dict):
@@ -1041,8 +1068,8 @@ class TeslaFleetAPIClient:
             
         except Exception as e:
             console.print(f"[red]Błąd pobierania harmonogramów ładowania: {e}[/red]")
-            return []
-    
+            return None
+
     def remove_all_charge_schedules(self, vehicle_id: str, use_proxy: bool = False) -> bool:
         """
         Usuwa wszystkie harmonogramy ładowania
@@ -1053,6 +1080,11 @@ class TeslaFleetAPIClient:
         """
         try:
             schedules = self.get_charge_schedules(vehicle_id)
+            if schedules is None:
+                # Błąd odczytu — NIE wolno uznać "brak harmonogramów = sukces",
+                # bo wołający doda nowe okna obok osieroconych starych.
+                console.print("[red]❌ Nie udało się odczytać harmonogramów — przerwano usuwanie (stare wpisy mogą istnieć).[/red]")
+                return False
             if not schedules:
                 console.print("[yellow]Brak harmonogramów do usunięcia.[/yellow]")
                 return True

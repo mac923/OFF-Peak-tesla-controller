@@ -303,9 +303,33 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             start_time = datetime.now(timezone.utc)
             
             try:
-                self.monitor.run_monitoring_cycle()
+                cycle_result = self.monitor.run_monitoring_cycle()
                 execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
-                
+
+                if cycle_result == 'busy':
+                    # Inny cykl w toku — świadomy no-op, NIE błąd (200, żeby scheduler nie ponawiał)
+                    logger.info(f"🔒 [WORKER] Cykl pominięty — inny cykl w toku")
+                    self._send_response(200, {
+                        "status": "skipped",
+                        "message": "Another monitoring cycle in progress (lock busy)",
+                        "triggered_by": "scout_function",
+                        "timestamp": start_time.isoformat()
+                    })
+                    return
+
+                if cycle_result == 'failed':
+                    # Porażka cyklu musi być widoczna dla retry Cloud Schedulera
+                    logger.error(f"❌ [WORKER] Cykl zakończony niepowodzeniem w {execution_time:.3f}s")
+                    self._send_response(500, {
+                        "status": "error",
+                        "error": "Monitoring cycle failed",
+                        "triggered_by": "scout_function",
+                        "scout_data": scout_data,
+                        "execution_time_seconds": round(execution_time, 3),
+                        "timestamp": start_time.isoformat()
+                    })
+                    return
+
                 response = {
                     "status": "success",
                     "message": "Worker cycle executed successfully",
@@ -320,10 +344,10 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
                         "total_cost": f"~{round(execution_time * 0.1 + 0.01, 2)} groszy"
                     }
                 }
-                
+
                 logger.info(f"✅ [WORKER] Cykl zakończony pomyślnie w {execution_time:.3f}s")
                 self._send_response(200, response)
-                
+
             except Exception as e:
                 execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
                 logger.error(f"❌ [WORKER] Błąd podczas cyklu: {e}")
@@ -614,9 +638,30 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             start_time = datetime.now(timezone.utc)
             
             try:
-                self.monitor.run_monitoring_cycle()
+                cycle_result = self.monitor.run_monitoring_cycle()
                 execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
-                
+
+                if cycle_result == 'busy':
+                    logger.info(f"🔒 [WORKER] Cykl pominięty — inny cykl w toku")
+                    self._send_response(200, {
+                        "status": "skipped",
+                        "message": "Another monitoring cycle in progress (lock busy)",
+                        "trigger": trigger_source,
+                        "timestamp": start_time.isoformat()
+                    })
+                    return
+
+                if cycle_result == 'failed':
+                    logger.error(f"❌ [WORKER] Cykl monitorowania nieudany w {execution_time:.3f}s")
+                    self._send_response(500, {
+                        "status": "error",
+                        "error": "Monitoring cycle failed",
+                        "trigger": trigger_source,
+                        "execution_time_seconds": round(execution_time, 3),
+                        "timestamp": start_time.isoformat()
+                    })
+                    return
+
                 response = {
                     "status": "success",
                     "message": "Monitoring cycle completed",

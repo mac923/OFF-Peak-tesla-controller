@@ -1032,28 +1032,30 @@ class TeslaController:
             console.print(f"[red]Błąd podczas ustawiania zaplanowanego ładowania: {e}[/red]")
             return False
     
-    def get_charge_schedules(self) -> List[Dict]:
+    def get_charge_schedules(self) -> Optional[List[Dict]]:
         """
         Pobiera istniejące harmonogramy ładowania używając Fleet API
-        
+
         Returns:
-            List[Dict]: Lista harmonogramów ładowania
+            List[Dict]: Lista harmonogramów ładowania ([] gdy potwierdzono brak)
+            None: Błąd odczytu — nie oznacza braku harmonogramów
         """
         if not self.current_vehicle:
             console.print("[red]Nie wybrano pojazdu.[/red]")
-            return []
-        
+            return None
+
         vehicle_id = self.current_vehicle.get('vin') or self.current_vehicle.get('id_s')
         if not vehicle_id:
             console.print("[red]Nie można pobrać VIN pojazdu.[/red]")
-            return []
-        
+            return None
+
         try:
             # Sprawdź czy proxy jest dostępny
             use_proxy = bool(hasattr(self.fleet_api, 'proxy_url') and self.fleet_api.proxy_url)
 
             if not self.wake_up_vehicle(use_proxy=use_proxy):
-                return []
+                # Błąd odczytu (None), nie "brak harmonogramów" ([])
+                return None
 
             console.print("[yellow]Pobieranie harmonogramów ładowania...[/yellow]")
             schedules = self.fleet_api.get_charge_schedules(vehicle_id)
@@ -1061,7 +1063,7 @@ class TeslaController:
 
         except Exception as e:
             console.print(f"[red]Błąd podczas pobierania harmonogramów: {e}[/red]")
-            return []
+            return None
 
     def days_of_week_to_string(self, days_of_week: int) -> str:
         """

@@ -981,11 +981,25 @@ def get_last_known_state(db: firestore.Client, vin: str) -> Optional[Dict[str, A
         logger.error(f"❌ Błąd pobierania stanu z Firestore: {e}")
         return None
 
-def save_current_state(db: firestore.Client, vin: str, location_data: Dict[str, Any], at_home: bool):
-    """Zapisuje aktualny stan pojazdu do Firestore"""
+def save_current_state(db: firestore.Client, vin: str, location_data: Dict[str, Any], at_home: bool,
+                       pending_trigger: Optional[Dict[str, Any]] = None,
+                       special_blocked: bool = False):
+    """
+    Zapisuje aktualny stan pojazdu do Firestore.
+
+    pending_trigger: gdy wywołanie Workera się nie powiodło, zapisujemy zaległy
+    trigger ({'reason', 'created_at'}) — następny tick ponowi wywołanie zamiast
+    uznać zdarzenie za "kontynuację stanu" i zgubić je na zawsze.
+    None czyści flagę (trigger udany albo brak triggera).
+
+    special_blocked: True gdy Warunek A był w tym ticku zablokowany przez sesję
+    special charging. Gdy sesja się skończy (flaga była True, teraz blokady brak),
+    Scout wymusza trigger — bez tego normalny harmonogram nie byłby przeliczony
+    aż do wypięcia i ponownego wpięcia kabla.
+    """
     try:
         doc_ref = db.collection('tesla_scout_state').document(vin)
-        
+
         # ROZSZERZONE: Zapisz dodatkowe dane o stanie ładowania
         state_data = {
             'vin': vin,
@@ -999,7 +1013,9 @@ def save_current_state(db: firestore.Client, vin: str, location_data: Dict[str, 
             'battery_level': location_data.get('battery_level', 0),
             'charging_state': location_data.get('charging_state', 'Unknown'),
             'is_charging_ready': location_data.get('is_charging_ready', False),
-            'vehicle_state': location_data.get('state', 'unknown')
+            'vehicle_state': location_data.get('state', 'unknown'),
+            'pending_trigger': pending_trigger,
+            'special_blocked': special_blocked
         }
         
         # Dodaj szczegółowe dane ładowania jeśli dostępne
@@ -1405,15 +1421,27 @@ def tesla_scout_main(request):
             logger.info(f"🔍 [SCOUT] DIAGNOSTYKA: current_at_home != last_state.get('at_home'): {current_at_home != last_state.get('at_home')}")
             print(f"🔍 [SCOUT] DIAGNOSTYKA: current_at_home != last_state.get('at_home'): {current_at_home != last_state.get('at_home')}")
         
+        blocked_by_special = False
         if vehicle_state == 'online' and current_at_home:
             # NOWE: Pojazd ONLINE i w domu - sprawdź Warunki A i B
             logger.info(f"🔍 [SCOUT] KROK 1: WARUNEK SPEŁNIONY - Pojazd online w domu - sprawdzam warunki A/B")
             print(f"🔍 [SCOUT] KROK 1: WARUNEK SPEŁNIONY - Pojazd online w domu - sprawdzam warunki A/B")
-            
+
             conditions_trigger, conditions_reason = check_conditions_a_b(location_data, last_state, vin)
-            
+            blocked_by_special = (not conditions_trigger) and ('Special charging' in (conditions_reason or ''))
+
             logger.info(f"🔍 [SCOUT] KROK 2: check_conditions_a_b zwrócił: trigger={conditions_trigger}, reason='{conditions_reason}'")
-            
+
+            # ODBLOKOWANIE PO SPECIAL: poprzedni tick blokowała sesja special,
+            # teraz blokady nie ma — wymuś przeliczenie normalnego harmonogramu
+            # (stan "gotowy" się nie zmienił, więc zwykła detekcja przejścia by milczała)
+            if (not conditions_trigger and not blocked_by_special
+                    and (last_state or {}).get('special_blocked')
+                    and location_data.get('is_charging_ready', False)):
+                conditions_trigger = True
+                conditions_reason = "Sesja special charging zakończona - przeliczenie normalnego harmonogramu OFF PEAK"
+                logger.info(f"🔓 [SCOUT] {conditions_reason}")
+
             if conditions_trigger:
                 trigger_worker = True
                 reason = conditions_reason
@@ -1430,16 +1458,43 @@ def tesla_scout_main(request):
                 logger.info(f"🔄 [SCOUT] KROK 3: Brak warunków do wywołania Worker - {conditions_reason}")
                 logger.info(f"🔄 [SCOUT] {conditions_reason}")
                 
+        # PENDING TRIGGER: zaległe (nieudane) wywołanie Workera z poprzednich ticków
+        # ma pierwszeństwo — bez tego wpięcie kabla w trakcie cold-startu Workera
+        # ginęło na zawsze ("kontynuacja stanu" przy każdym kolejnym ticku).
+        PENDING_TRIGGER_MAX_AGE_SECONDS = 6 * 3600
+        pending = (last_state or {}).get('pending_trigger')
+        if pending and not trigger_worker:
+            try:
+                pending_age = (datetime.now(timezone.utc)
+                               - datetime.fromisoformat(pending['created_at'])).total_seconds()
+            except (KeyError, ValueError, TypeError):
+                pending_age = None
+            if pending_age is not None and pending_age <= PENDING_TRIGGER_MAX_AGE_SECONDS:
+                trigger_worker = True
+                reason = f"RETRY zaległego triggera ({int(pending_age / 60)} min): {pending.get('reason', 'unknown')}"
+                logger.warning(f"🔁 [SCOUT] {reason}")
+            else:
+                logger.error(f"🚨 [SCOUT] ALERT: pending_trigger starszy niż 6h lub uszkodzony — porzucam: {pending}")
+
         # Wywołaj Worker jeśli potrzeba
         worker_called = False
         if trigger_worker:
             worker_called = trigger_worker_service(reason, location_data)
-        
+
         # NAPRAWKA: Zapisz aktualny stan NA KOŃCU (po sprawdzeniu warunków A/B)
         # To naprawia problem nadmiarowej detekcji Warunku A - teraz last_state zawiera
         # rzeczywiście poprzedni stan, nie aktualny
         if vehicle_state == 'online':
-            save_current_state(db, vin, location_data, current_at_home)
+            new_pending = None
+            if trigger_worker and not worker_called:
+                # Nie gub zdarzenia: zapisz zaległy trigger do ponowienia w następnym ticku.
+                # Przy retry zachowaj oryginalny created_at, żeby limit 6h działał od zdarzenia.
+                created_at = (pending or {}).get('created_at') if pending and reason.startswith('RETRY') \
+                    else datetime.now(timezone.utc).isoformat()
+                new_pending = {'reason': reason, 'created_at': created_at}
+                logger.warning(f"⚠️ [SCOUT] Worker NIE wywołany — zapisuję pending_trigger do ponowienia")
+            save_current_state(db, vin, location_data, current_at_home,
+                               pending_trigger=new_pending, special_blocked=blocked_by_special)
             logger.info(f"💾 [SCOUT] Stan pojazdu zapisany po sprawdzeniu warunków A/B")
         elif vehicle_state == 'offline' and last_state and last_state.get('online', False):
             # NAPRAWKA: Zapisz stan offline TYLKO gdy pojazd przechodzi z online na offline

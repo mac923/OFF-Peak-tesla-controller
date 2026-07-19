@@ -51,7 +51,8 @@ import json
 import time
 import logging
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import uuid
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -350,15 +351,18 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             logger.info(f"{time_str} 📅 Cloud Scheduler: Rozpoczęcie cyklu monitorowania")
             
             # Wykonaj cykl monitorowania
-            self.monitor.run_monitoring_cycle()
-            
+            cycle_result = self.monitor.run_monitoring_cycle()
+
+            if cycle_result == 'failed':
+                raise RuntimeError("Monitoring cycle failed")
+
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            
+
             response = {
-                'status': 'cycle_completed',
-                'message': 'Monitoring cycle completed successfully',
+                'status': 'cycle_completed' if cycle_result == 'ok' else 'cycle_skipped_lock_busy',
+                'message': 'Monitoring cycle completed successfully' if cycle_result == 'ok' else 'Another cycle in progress',
                 'timestamp': warsaw_time.isoformat(),
                 'timezone': 'Europe/Warsaw',
                 'trigger': 'cloud_scheduler'
@@ -547,12 +551,20 @@ class CloudTeslaMonitor:
         self.http_server = None
         self.http_thread = None
         
-        # Ładowanie stanu z Cloud Storage
-        self._load_monitoring_state()
-        
         # NOWE: Cache dla harmonogramów OFF PEAK CHARGE
+        # (inicjalizacja PRZED _load_monitoring_state, które może je wypełnić z Cloud Storage)
         self.last_off_peak_schedules: Dict[str, Dict] = {}  # VIN -> harmonogram hash
         self.last_tesla_schedules_home: Dict[str, List[Dict]] = {}  # VIN -> lista harmonogramów HOME
+
+        # Ładowanie stanu z Cloud Storage
+        self._load_monitoring_state()
+
+        # Identyfikator instancji dla lease-locka cyklu (Firestore)
+        self.instance_id = uuid.uuid4().hex
+
+        # Retry-budget: licznik nieudanych prób zastosowania harmonogramu per VIN
+        # (chroni przed spamem komend do pojazdu przy trwałym błędzie)
+        self.schedule_apply_attempts: Dict[str, Dict[str, Any]] = {}
         
     def _load_monitoring_state(self):
         """Ładuje stan monitorowania z Cloud Storage"""
@@ -589,17 +601,253 @@ class CloudTeslaMonitor:
                     case_id: case.to_dict()
                     for case_id, case in self.active_cases.items()
                 },
+                # Stan decyzyjny musi przeżyć scale-to-zero (patrz _load_monitoring_state)
+                'last_off_peak_schedules': self.last_off_peak_schedules,
+                'last_vehicle_state': self.last_vehicle_state,
                 'last_update': self._get_warsaw_time().isoformat()
             }
             
             bucket = self.storage_client.bucket(self.bucket_name)
             blob = bucket.blob('monitoring_state.json')
             blob.upload_from_string(json.dumps(state_data, indent=2))
-            
+
             logger.debug("Stan monitorowania zapisany do Cloud Storage")
-            
+
         except Exception as e:
             logger.error(f"Błąd zapisu stanu monitorowania: {e}")
+
+    # ========== LEASE-LOCK CYKLU (Firestore) ==========
+
+    CYCLE_LOCK_TTL_SECONDS = 300  # zgodne z timeoutSeconds Cloud Run — ubita instancja nie blokuje dłużej
+
+    def _acquire_cycle_lock(self) -> bool:
+        """
+        Przejmuje lease-lock cyklu w Firestore (locks/monitoring_cycle).
+        Chroni przed równoległymi cyklami (retry Cloud Schedulera, trigger Scout
+        nakładający się na failsafe/midnight, druga instancja Cloud Run).
+
+        Returns:
+            bool: True gdy lock przejęty (lub tryb lokalny bez Firestore)
+        """
+        if not self.firestore_client:
+            return True
+        lock_ref = self.firestore_client.collection('locks').document('monitoring_cycle')
+        now = datetime.now(timezone.utc)
+        transaction = self.firestore_client.transaction()
+
+        @firestore.transactional
+        def _try_acquire(tx):
+            snapshot = lock_ref.get(transaction=tx)
+            if snapshot.exists:
+                data = snapshot.to_dict() or {}
+                expires_at = data.get('expires_at')
+                if expires_at is not None and expires_at > now:
+                    return False
+            tx.set(lock_ref, {
+                'owner': self.instance_id,
+                'acquired_at': now,
+                'expires_at': now + timedelta(seconds=self.CYCLE_LOCK_TTL_SECONDS)
+            })
+            return True
+
+        try:
+            acquired = _try_acquire(transaction)
+            if not acquired:
+                logger.info("🔒 Cykl monitorowania już trwa (lock zajęty) — pomijam ten trigger")
+            return acquired
+        except Exception as e:
+            # Lock to zabezpieczenie, nie twarda zależność — awaria Firestore nie może zatrzymać systemu
+            logger.warning(f"⚠️ Błąd akwizycji locka cyklu ({e}) — kontynuuję bez locka")
+            return True
+
+    def _release_cycle_lock(self):
+        """Zwalnia lease-lock cyklu (tylko jeśli należy do tej instancji)."""
+        if not self.firestore_client:
+            return
+        try:
+            lock_ref = self.firestore_client.collection('locks').document('monitoring_cycle')
+            snapshot = lock_ref.get()
+            if snapshot.exists and (snapshot.to_dict() or {}).get('owner') == self.instance_id:
+                lock_ref.delete()
+        except Exception as e:
+            logger.warning(f"⚠️ Błąd zwalniania locka cyklu: {e} (wygaśnie sam po TTL)")
+
+    # ========== RETRY-BUDGET ZASTOSOWANIA HARMONOGRAMU ==========
+
+    SCHEDULE_APPLY_MAX_ATTEMPTS = 3
+    SCHEDULE_APPLY_COOLDOWN_SECONDS = 2 * 3600
+
+    def _schedule_apply_blocked(self, vehicle_vin: str, schedule_hash: str) -> bool:
+        """
+        True gdy dla tego planu wyczerpano SCHEDULE_APPLY_MAX_ATTEMPTS prób
+        i trwa cooldown. Chroni pojazd przed spamem wake/add/remove co 15 min
+        przy trwałym błędzie (np. proxy padło na stałe).
+        """
+        entry = self.schedule_apply_attempts.get(vehicle_vin)
+        if not entry or entry.get('hash') != schedule_hash:
+            return False
+        if entry.get('attempts', 0) < self.SCHEDULE_APPLY_MAX_ATTEMPTS:
+            return False
+        elapsed = time.time() - entry.get('last_attempt_ts', 0)
+        if elapsed >= self.SCHEDULE_APPLY_COOLDOWN_SECONDS:
+            self.schedule_apply_attempts.pop(vehicle_vin, None)
+            return False
+        remaining_min = int((self.SCHEDULE_APPLY_COOLDOWN_SECONDS - elapsed) / 60)
+        logger.error(
+            f"🚨 ALERT: {entry.get('attempts')} nieudanych prób zastosowania harmonogramu dla "
+            f"{vehicle_vin[-4:]} — cooldown jeszcze {remaining_min} min (hash {schedule_hash[:8]})"
+        )
+        return True
+
+    def _record_schedule_apply_failure(self, vehicle_vin: str, schedule_hash: str):
+        entry = self.schedule_apply_attempts.get(vehicle_vin)
+        if entry and entry.get('hash') == schedule_hash:
+            entry['attempts'] = entry.get('attempts', 0) + 1
+            entry['last_attempt_ts'] = time.time()
+        else:
+            entry = {'hash': schedule_hash, 'attempts': 1, 'last_attempt_ts': time.time()}
+            self.schedule_apply_attempts[vehicle_vin] = entry
+        logger.warning(
+            f"⚠️ Nieudana próba {entry['attempts']}/{self.SCHEDULE_APPLY_MAX_ATTEMPTS} "
+            f"zastosowania harmonogramu dla {vehicle_vin[-4:]}"
+        )
+
+    def _clear_schedule_apply_failures(self, vehicle_vin: str):
+        self.schedule_apply_attempts.pop(vehicle_vin, None)
+
+    # ========== WYRÓWNANIE STANU ŁADOWANIA Z PLANEM (Faza 2) ==========
+
+    def _current_time_overlaps_schedules(self, schedules: List['ChargeSchedule']) -> bool:
+        """Sprawdza, czy któreś włączone okno harmonogramu pokrywa obecną chwilę (czas warszawski)."""
+        now = self._get_warsaw_time()
+        now_min = now.hour * 60 + now.minute
+        for s in schedules:
+            if not s.enabled or s.start_time is None or s.end_time is None:
+                continue
+            start = s.start_time % 1440
+            end = s.end_time % 1440
+            if start <= end:
+                if start <= now_min < end:
+                    return True
+            else:
+                # Okno przez północ (np. 23:00-06:00)
+                if now_min >= start or now_min < end:
+                    return True
+        return False
+
+    def _get_protected_schedule_ids(self, vehicle_vin: str) -> Optional[set]:
+        """
+        ID harmonogramów należących do sesji special charging SCHEDULED/ACTIVE —
+        zwykły cykl NIE może ich usuwać (wcześniej wymiatał je jako "stare okna HOME",
+        po cichu kasując sesję special w trakcie jej trwania).
+
+        Returns:
+            set: chronione ID ([] gdy brak sesji),
+            None: błąd odczytu — wołający musi przerwać usuwanie (nie wie, co chronić)
+        """
+        if not self.firestore_client:
+            return set()
+        try:
+            sessions_ref = self.firestore_client.collection('special_charging_sessions')
+            query = sessions_ref.where('vin', '==', vehicle_vin).where('status', 'in', ['ACTIVE', 'SCHEDULED'])
+            protected = set()
+            for doc in query.stream():
+                for schedule_id in (doc.to_dict() or {}).get('tesla_schedule_ids') or []:
+                    protected.add(schedule_id)
+            if protected:
+                logger.info(f"🔒 Chronione harmonogramy special dla {vehicle_vin[-4:]}: {sorted(protected)}")
+            return protected
+        except Exception as e:
+            logger.error(f"❌ Błąd odczytu chronionych harmonogramów special: {e}")
+            return None
+
+    def _has_active_special_session(self, vehicle_vin: str) -> bool:
+        """True gdy w Firestore istnieje sesja special charging SCHEDULED/ACTIVE dla pojazdu."""
+        if not self.firestore_client:
+            return False
+        try:
+            sessions_ref = self.firestore_client.collection('special_charging_sessions')
+            query = sessions_ref.where('vin', '==', vehicle_vin).where('status', 'in', ['ACTIVE', 'SCHEDULED'])
+            return len(list(query.stream())) > 0
+        except Exception as e:
+            # Przy błędzie odczytu załóż ostrożnie, że sesja może istnieć —
+            # lepiej nie zatrzymać special charging niż zatrzymać go błędnie
+            logger.warning(f"⚠️ Błąd sprawdzania sesji special charging: {e} — zakładam, że sesja istnieje")
+            return True
+
+    def _align_charging_with_plan(self, schedules: List['ChargeSchedule'], vehicle_vin: str,
+                                  vehicle_status: Optional[Dict[str, Any]]):
+        """
+        Po zastosowaniu nowego planu wyrównuje faktyczny stan ładowania:
+        - okno pokrywa "teraz", a pojazd nie ładuje → charge_start
+          (Tesla po dodaniu okna w jego trakcie potrafi czekać do następnej granicy),
+        - pojazd ładuje, a żadne okno nie pokrywa "teraz" → charge_stop
+          (scenariusz: wpięcie w trakcie starego okna, które właśnie usunęliśmy).
+
+        charge_stop jest gated:
+        - CHARGE_STOP_ENFORCE=false (domyślnie) → tylko log (shadow mode),
+        - bateria < MIN_SOC_FORCE_CHARGE (domyślnie 30%) → nie zatrzymuj
+          (niski poziom baterii ma priorytet nad taryfą, także przy ładowaniu
+          uruchomionym ręcznie przez użytkownika),
+        - aktywna/zaplanowana sesja special charging → nie zatrzymuj.
+        Błędy tej fazy nie unieważniają zastosowanego planu (best-effort, głośno logowane).
+        """
+        if not vehicle_status:
+            return
+        try:
+            charging_state = vehicle_status.get('charging_state', 'Unknown')
+            battery_level = vehicle_status.get('battery_level', 0)
+            overlap = self._current_time_overlaps_schedules(schedules)
+            use_proxy = bool(getattr(self.tesla_controller.fleet_api, 'proxy_url', None))
+
+            if overlap and charging_state in ('Stopped', 'NoPower', 'Complete'):
+                if charging_state == 'Complete':
+                    return  # naładowany do limitu — nie ma czego startować
+                logger.info(f"⚡ Okno harmonogramu pokrywa obecną godzinę, a pojazd nie ładuje — wysyłam charge_start")
+                start_ok = self.tesla_controller.fleet_api.charge_start(vehicle_vin, use_proxy=use_proxy)
+                self._log_event(
+                    message="Auto charge_start (window overlaps now)",
+                    vehicle_vin=vehicle_vin,
+                    extra_data={'operation': 'align_charging', 'action': 'charge_start', 'success': start_ok}
+                )
+                if not start_ok:
+                    logger.error(f"❌ charge_start nie powiódł się")
+
+            elif not overlap and charging_state == 'Charging':
+                enforce = os.getenv('CHARGE_STOP_ENFORCE', 'false').lower() == 'true'
+                min_soc = int(os.getenv('MIN_SOC_FORCE_CHARGE', '30'))
+
+                if battery_level < min_soc:
+                    logger.info(f"🔋 Pojazd ładuje poza oknem, ale bateria {battery_level}% < {min_soc}% — NIE zatrzymuję")
+                    return
+                if self._has_active_special_session(vehicle_vin):
+                    logger.info(f"🔋 Pojazd ładuje poza oknem, ale trwa sesja special charging — NIE zatrzymuję")
+                    return
+
+                if not enforce:
+                    # SHADOW MODE: tylko log do porównania z rzeczywistością przed włączeniem enforce
+                    logger.warning(f"👻 [SHADOW] Tu wysłałbym charge_stop: ładowanie {battery_level}% poza oknem taniej taryfy "
+                                   f"(włącz CHARGE_STOP_ENFORCE=true po weryfikacji)")
+                    self._log_event(
+                        message="[SHADOW] charge_stop would be sent (charging outside plan window)",
+                        vehicle_vin=vehicle_vin,
+                        extra_data={'operation': 'align_charging', 'action': 'charge_stop_shadow',
+                                    'battery_level': battery_level}
+                    )
+                    return
+
+                logger.warning(f"🛑 Pojazd ładuje poza oknem taniej taryfy ({battery_level}%) — wysyłam charge_stop")
+                stop_ok = self.tesla_controller.fleet_api.charge_stop(vehicle_vin, use_proxy=use_proxy)
+                self._log_event(
+                    message="Auto charge_stop (charging outside plan window)",
+                    vehicle_vin=vehicle_vin,
+                    extra_data={'operation': 'align_charging', 'action': 'charge_stop', 'success': stop_ok,
+                                'battery_level': battery_level}
+                )
+                if not stop_ok:
+                    logger.error(f"❌ charge_stop nie powiódł się — pojazd może ładować w drogiej taryfie")
+        except Exception as e:
+            logger.error(f"❌ Błąd wyrównania stanu ładowania z planem: {e}")
     
     def _get_warsaw_time(self) -> datetime:
         """
@@ -924,7 +1172,15 @@ class CloudTeslaMonitor:
             # 3. Pobierz wszystkie harmonogramy HOME z Tesla
             logger.info(f"{time_str} 📋 Pobieranie aktualnych harmonogramów HOME z Tesla...")
             home_schedules = self._get_home_schedules_from_tesla(vehicle_vin)
-            
+
+            if home_schedules is None:
+                logger.error(f"{time_str} ❌ Nie udało się odczytać harmonogramów HOME")
+                return {
+                    'success': False,
+                    'error': 'Błąd odczytu harmonogramów z Tesla',
+                    'timestamp': warsaw_time.isoformat()
+                }
+
             if not home_schedules:
                 logger.info(f"{time_str} ✅ Brak harmonogramów HOME do usunięcia")
                 return {
@@ -992,7 +1248,10 @@ class CloudTeslaMonitor:
             # 8. Weryfikacja - sprawdź czy harmonogramy zostały usunięte
             logger.info(f"{time_str} 🔍 Weryfikacja usunięcia harmonogramów...")
             remaining_schedules = self._get_home_schedules_from_tesla(vehicle_vin)
-            
+            if remaining_schedules is None:
+                logger.warning(f"{time_str} ⚠️ Nie udało się zweryfikować pozostałych harmonogramów")
+                remaining_schedules = []
+
             # 9. Wyczyść cache harmonogramów Tesla HOME
             if vehicle_vin in self.last_tesla_schedules_home:
                 del self.last_tesla_schedules_home[vehicle_vin]
@@ -1138,15 +1397,27 @@ class CloudTeslaMonitor:
             logger.error(f"❌ KRYTYCZNY błąd sprawdzania statusu pojazdu: {e}")
             return None
     
-    def _handle_condition_a(self, status: Dict[str, Any]):
+    def _handle_condition_a(self, status: Dict[str, Any], force: bool = False) -> bool:
         """
         Obsługuje warunek A: ONLINE + is_charging_ready=true + HOME
-        
+
         Args:
             status: Status pojazdu
+            force: True (midnight wake / failsafe) — pomija guard przejścia stanu
+                   ORAZ porównanie hasha: zawsze świeże wywołanie OFF PEAK API
+                   i pełna rekoncyliacja. Bez tego pojazd wpięty od wieczora nigdy
+                   nie dostawał planu na nowy dzień (guard widział "stan bez zmian").
+                   Rekoncyliacja gwarantuje, że przy zgodnym stanie nie polecą
+                   żadne komendy do pojazdu.
+
+        Returns:
+            bool: True gdy nic nie było do zrobienia albo operacje się powiodły;
+                  False gdy próba zastosowania harmonogramu zawiodła (cykl ma
+                  NIE zapisywać stanu, żeby następny tick ponowił próbę)
         """
         battery_level = status.get('battery_level', 0)
         vehicle_vin = status.get('vin', 'Unknown')
+        apply_ok = True
         
         # Pobierz aktualny czas warszawski
         warsaw_time = self._get_warsaw_time()
@@ -1181,13 +1452,24 @@ class CloudTeslaMonitor:
                 api_response = self._call_off_peak_charge_api(battery_level, vehicle_vin)
                 if api_response and api_response.get('success'):
                     # Sprawdź czy harmonogram jest różny od poprzedniego
-                    if self._is_schedule_different(vehicle_vin, api_response):
+                    # (force pomija hash — rekoncyliacja i tak nie wyśle zbędnych komend)
+                    if force or self._is_schedule_different(vehicle_vin, api_response):
+                        schedule_hash = self._generate_schedule_hash(api_response)
+
+                        # RETRY-BUDGET: po wyczerpaniu prób nie spamuj pojazdu komendami
+                        if self._schedule_apply_blocked(vehicle_vin, schedule_hash):
+                            return False
+
                         logger.info(f"{time_str} 🔄 Harmonogram RÓŻNY - rozpoczynam zarządzanie harmonogramami Tesla")
-                        
+
                         # Zarządzaj harmonogramami Tesla
-                        if self._manage_tesla_charging_schedules(api_response, vehicle_vin):
+                        if self._manage_tesla_charging_schedules(api_response, vehicle_vin, vehicle_status=status):
                             logger.info(f"{time_str} ✅ Pomyślnie zaktualizowano harmonogramy ładowania Tesla")
-                            
+
+                            # Hash zatwierdzany dopiero po potwierdzonym sukcesie
+                            self._commit_schedule_hash(vehicle_vin, api_response)
+                            self._clear_schedule_apply_failures(vehicle_vin)
+
                             # Zapisz informacje o pełnej operacji
                             self._log_event(
                                 message="OFF PEAK CHARGE schedule applied to Tesla successfully",
@@ -1204,6 +1486,8 @@ class CloudTeslaMonitor:
                             )
                         else:
                             logger.error(f"{time_str} ❌ Błąd aktualizacji harmonogramów Tesla")
+                            self._record_schedule_apply_failure(vehicle_vin, schedule_hash)
+                            apply_ok = False
                             self._log_event(
                                 message="Failed to apply OFF PEAK CHARGE schedule to Tesla",
                                 battery_level=battery_level,
@@ -1232,6 +1516,7 @@ class CloudTeslaMonitor:
                         )
                 else:
                     logger.warning("⚠️ OFF PEAK CHARGE API - brak prawidłowej odpowiedzi")
+                    apply_ok = False  # brak planu = próba nieudana; stan niezapisany → retry przy następnym ticku
                     self._log_event(
                         message="OFF PEAK CHARGE API failed or returned invalid response",
                         battery_level=battery_level,
@@ -1244,6 +1529,7 @@ class CloudTeslaMonitor:
                     )
             except Exception as api_error:
                 logger.error(f"❌ Błąd obsługi OFF PEAK CHARGE API: {api_error}")
+                apply_ok = False
                 self._log_event(
                     message="OFF PEAK CHARGE API processing error",
                     battery_level=battery_level,
@@ -1278,7 +1564,9 @@ class CloudTeslaMonitor:
             del self.active_cases[vehicle_vin]
             self._save_monitoring_state()
             logger.info(f"{time_str} ✅ Zakończono przypadek B - pojazd gotowy do ładowania")
-    
+
+        return apply_ok
+
     def _handle_condition_b(self, status: Dict[str, Any]):
         """
         Obsługuje warunek B: ONLINE + HOME + is_charging_ready=false (pierwszy raz)
@@ -1416,8 +1704,25 @@ class CloudTeslaMonitor:
                 case.last_check_time = self._get_warsaw_time()
                 case.last_battery_level = current_status.get('battery_level', case.last_battery_level)
     
-    def run_monitoring_cycle(self):
-        """Wykonuje pojedynczy cykl monitorowania"""
+    def run_monitoring_cycle(self) -> str:
+        """
+        Wykonuje pojedynczy cykl monitorowania pod lease-lockiem.
+
+        Returns:
+            str: 'ok'     — cykl zakończony pomyślnie,
+                 'busy'   — inny cykl w toku (no-op, NIE jest błędem),
+                 'failed' — cykl nieudany (endpoint HTTP powinien zwrócić 500,
+                            żeby retry Cloud Schedulera zadziałał)
+        """
+        if not self._acquire_cycle_lock():
+            return 'busy'
+        try:
+            return self._run_monitoring_cycle_locked()
+        finally:
+            self._release_cycle_lock()
+
+    def _run_monitoring_cycle_locked(self) -> str:
+        """Właściwy cykl monitorowania (wołać tylko pod lockiem)."""
         cycle_id = int(time.time())
         try:
             # NAPRAWKA: Jeśli Smart Proxy Mode i komponenty gotowe, przygotuj proxy na początku cyklu
@@ -1443,15 +1748,15 @@ class CloudTeslaMonitor:
                 status = self._check_vehicle_status()
                 if not status:
                     logger.warning(f"⚠️ Nie udało się pobrać statusu pojazdu")
-                    return
+                    return 'failed'
             except TeslaAuthenticationError as auth_ex:
                 logger.error(f"🚫 Błąd autoryzacji Tesla: {auth_ex}")
                 logger.error(f"⚠️ Możliwe wygaśnięcie tokenów - należy ponownie autoryzować aplikację")
                 # Nie przerywaj aplikacji - po prostu pomiń ten cykl
-                return
+                return 'failed'
             except Exception as status_ex:
                 logger.error(f"❌ Błąd pobierania statusu: {status_ex}")
-                return
+                return 'failed'
             
             is_online = status.get('online', False)
             is_charging_ready = status.get('is_charging_ready', False)
@@ -1521,13 +1826,15 @@ class CloudTeslaMonitor:
                 # Kontynuuj mimo błędu
             
             # Sprawdź warunki główne (bez szczegółowych logów)
+            condition_a_ok = True
             if is_online and location_status == 'HOME':
                 if is_charging_ready:
                     # Warunek A: ONLINE + is_charging_ready=true + HOME
                     try:
-                        self._handle_condition_a(status)
+                        condition_a_ok = self._handle_condition_a(status)
                     except Exception as cond_a_ex:
                         logger.error(f"❌ Błąd obsługi warunku A: {cond_a_ex}")
+                        condition_a_ok = False
                 else:
                     # Warunek B: ONLINE + HOME + is_charging_ready=false
                     try:
@@ -1623,22 +1930,43 @@ class CloudTeslaMonitor:
                         )
                         _log_simple_status(status, "przyjazd do domu")
             
-            # Zapisz aktualny stan pojazdu dla porównania w następnym cyklu
+            # Zapisz aktualny stan pojazdu dla porównania w następnym cyklu.
+            # Przy nieudanej próbie zastosowania harmonogramu stan celowo NIE jest
+            # zapisywany — następny tick zobaczy ponownie "zmianę" i ponowi próbę
+            # (ograniczone przez retry-budget w _schedule_apply_blocked).
             vehicle_vin = status.get('vin', 'Unknown')
-            self.last_vehicle_state[vehicle_vin] = {
-                'online': is_online,
-                'is_charging_ready': is_charging_ready,
-                'location_status': location_status,
-                'battery_level': status.get('battery_level', 0),
-                'last_update': self._get_warsaw_time().isoformat()
-            }
-                
+            if condition_a_ok:
+                self.last_vehicle_state[vehicle_vin] = {
+                    'online': is_online,
+                    'is_charging_ready': is_charging_ready,
+                    'location_status': location_status,
+                    'battery_level': status.get('battery_level', 0),
+                    'last_update': self._get_warsaw_time().isoformat()
+                }
+                self._save_monitoring_state()
+            else:
+                logger.warning(f"⚠️ Stan pojazdu {vehicle_vin[-4:]} NIE zapisany (nieudana aplikacja harmonogramu) — retry przy następnym cyklu")
+
+            return 'ok' if condition_a_ok else 'failed'
+
         except Exception as e:
             logger.error(f"❌ KRYTYCZNY błąd w cyklu monitorowania: {e}")
-            # Nie przerywaj aplikacji - loguj i kontynuuj
+            # Nie przerywaj aplikacji - loguj i zwróć porażkę (endpoint odda 500 → retry schedulera)
+            return 'failed'
     
     def run_midnight_wake_check(self):
         """Wykonuje jednorazowe wybudzenie pojazdu o godzinie 0:00 czasu warszawskiego i sprawdza stan"""
+        # Ten sam lease-lock co zwykły cykl — midnight nie może nakładać się
+        # z triggerem Scout ani retry schedulera
+        if not self._acquire_cycle_lock():
+            logger.info("🔒 Midnight wake pominięty — inny cykl w toku")
+            return
+        try:
+            self._run_midnight_wake_check_locked()
+        finally:
+            self._release_cycle_lock()
+
+    def _run_midnight_wake_check_locked(self):
         try:
             warsaw_time = self._get_warsaw_time()
             time_str = warsaw_time.strftime("[%H:%M]")
@@ -2085,21 +2413,34 @@ class CloudTeslaMonitor:
         """
         new_hash = self._generate_schedule_hash(new_schedule_data)
         last_hash = self.last_off_peak_schedules.get(vehicle_vin, {}).get('hash', '')
-        
+
         is_different = new_hash != last_hash
-        
+
+        # UWAGA: sama detekcja NIE zapisuje hasha. Zapis następuje dopiero po
+        # potwierdzonym zastosowaniu w pojeździe (_commit_schedule_hash) —
+        # inaczej porażka wysyłki blokowałaby retry ("IDENTYCZNY" mimo tego,
+        # że w aucie nic się nie zmieniło).
         if is_different:
-            # Zapisz nowy hash
-            self.last_off_peak_schedules[vehicle_vin] = {
-                'hash': new_hash,
-                'timestamp': datetime.now().isoformat(),
-                'schedule_data': new_schedule_data
-            }
             logger.info(f"📋 Harmonogram dla {vehicle_vin[-4:]}: {'RÓŻNY' if last_hash else 'PIERWSZY'} (hash: {new_hash[:8]}...)")
         else:
             logger.info(f"📋 Harmonogram dla {vehicle_vin[-4:]}: IDENTYCZNY (hash: {new_hash[:8]}...)")
-        
+
         return is_different
+
+    def _commit_schedule_hash(self, vehicle_vin: str, new_schedule_data: Dict[str, Any]):
+        """
+        Zatwierdza hash harmonogramu PO potwierdzonym zastosowaniu w pojeździe.
+        Wołać wyłącznie gdy _manage_tesla_charging_schedules zwróciło True.
+        """
+        new_hash = self._generate_schedule_hash(new_schedule_data)
+        self.last_off_peak_schedules[vehicle_vin] = {
+            'hash': new_hash,
+            'timestamp': datetime.now().isoformat(),
+            'schedule_data': new_schedule_data
+        }
+        logger.info(f"📋 Hash harmonogramu zatwierdzony po sukcesie dla {vehicle_vin[-4:]} (hash: {new_hash[:8]}...)")
+        # Persystuj — hash musi przeżyć scale-to-zero, inaczej cold start robi pełny rewrite
+        self._save_monitoring_state()
 
     def _is_schedule_for_today(self, start_warsaw: datetime, end_warsaw: datetime) -> bool:
         """
@@ -2397,15 +2738,21 @@ class CloudTeslaMonitor:
                             self.tesla_controller.select_vehicle(0)
                 else:
                     logger.error("Nie można połączyć się z Tesla API")
-                    return []
-            
+                    return None
+
             if not self.tesla_controller.current_vehicle:
                 logger.error(f"Nie można znaleźć pojazdu {vehicle_vin[-4:]}")
-                return []
-            
+                return None
+
             # Pobierz wszystkie harmonogramy
             all_schedules = self.tesla_controller.get_charge_schedules()
-            
+
+            if all_schedules is None:
+                # Błąd odczytu — NIE oznacza braku harmonogramów; wołający nie może
+                # na tej podstawie dodawać nowych okien obok nieznanych starych
+                logger.error(f"📍 Błąd odczytu harmonogramów z Tesla dla {vehicle_vin[-4:]}")
+                return None
+
             if not all_schedules:
                 logger.info(f"📍 Brak harmonogramów w Tesla dla {vehicle_vin[-4:]}")
                 return []
@@ -2447,10 +2794,24 @@ class CloudTeslaMonitor:
             
         except Exception as e:
             logger.error(f"Błąd pobierania harmonogramów HOME: {e}")
-            return []
-    
+            return None
 
-    
+    def _schedule_content_matches(self, vehicle_schedule: Dict, desired: 'ChargeSchedule') -> bool:
+        """
+        Porównuje harmonogram odczytany z pojazdu z pożądanym po treści
+        (czasy + enabled). Umożliwia idempotentną rekoncylację: retry po
+        częściowej porażce nie duplikuje już obecnych okien.
+        """
+        if 'one_time' in vehicle_schedule and bool(vehicle_schedule['one_time']) != bool(desired.one_time):
+            # Porównuj one_time tylko gdy pojazd raportuje to pole — brak klucza
+            # w odczycie nie może wymuszać wiecznego przepisywania okien
+            return False
+        return (
+            vehicle_schedule.get('start_time') == desired.start_time
+            and vehicle_schedule.get('end_time') == desired.end_time
+            and bool(vehicle_schedule.get('enabled', False)) == bool(desired.enabled)
+        )
+
     def _add_schedules_to_tesla(self, schedules: List[ChargeSchedule], vehicle_vin: str) -> bool:
         """
         Dodaje harmonogramy ładowania do pojazdu Tesla z opóźnieniami i weryfikacją
@@ -2499,13 +2860,29 @@ class CloudTeslaMonitor:
             if success_count > 0:
                 logger.info(f"🔍 Weryfikacja dodanych harmonogramów...")
                 time.sleep(2)  # Krótkie opóźnienie przed weryfikacją
-                
-                # Sprawdź ile harmonogramów HOME jest rzeczywiście w Tesla
+
+                # Sprawdź czy KAŻDY dodany harmonogram jest rzeczywiście w Tesla.
+                # (Porównanie samych liczb było bez sensu: przed usunięciem starych
+                # w pojeździe są jeszcze stare okna — liczby prawie nigdy się nie zgadzały.)
                 verification_schedules = self._get_home_schedules_from_tesla(vehicle_vin)
-                verified_count = len(verification_schedules)
-                
-                logger.info(f"📊 Weryfikacja: dodano {success_count}, znaleziono {verified_count} harmonogramów HOME")
-                
+                if verification_schedules is None:
+                    # Best-effort: komendy add mają już twardą weryfikację przez pole result;
+                    # nieudany odczyt kontrolny nie unieważnia operacji
+                    logger.warning(f"⚠️ Nie udało się odczytać harmonogramów do weryfikacji — pomijam kontrolę")
+                    verification_schedules = []
+                else:
+                    missing = [
+                        s for s in schedules
+                        if not any(self._schedule_content_matches(v, s) for v in verification_schedules)
+                    ]
+                    if missing:
+                        for s in missing:
+                            logger.error(f"❌ Harmonogram {s.start_time}-{s.end_time} min zgłoszony jako dodany, "
+                                         f"ale NIE znaleziony w pojeździe")
+                        return False
+
+                logger.info(f"📊 Weryfikacja: dodano {success_count}, w pojeździe {len(verification_schedules)} harmonogramów HOME")
+
                 # Loguj szczegóły znalezionych harmonogramów
                 for j, verified_schedule in enumerate(verification_schedules):
                     schedule_id = verified_schedule.get('id', 'BRAK')
@@ -2527,13 +2904,7 @@ class CloudTeslaMonitor:
                     logger.info(f"📋 Harmonogram #{j+1} w Tesla: ID={schedule_id}, "
                               f"{start_time_display}-{end_time_display}, enabled={enabled}")
                 
-                # Ostrzeżenie jeśli liczba nie zgadza się
-                if verified_count != success_count:
-                    logger.warning(f"⚠️ NIEZGODNOŚĆ: wysłano {success_count} harmonogramów, "
-                                 f"ale znaleziono {verified_count} w Tesla")
-                    logger.warning(f"⚠️ Możliwe przyczyny: konflikt harmonogramów, opóźnienia API, nadpisywanie")
-                else:
-                    logger.info(f"✅ Weryfikacja pomyślna: wszystkie harmonogramy dodane poprawnie")
+                logger.info(f"✅ Weryfikacja pomyślna: wszystkie dodane harmonogramy obecne w pojeździe")
             
             # Loguj szczegółowe wyniki
             logger.info(f"📊 Wynik dodawania harmonogramów:")
@@ -2629,7 +3000,13 @@ class CloudTeslaMonitor:
                 # 1. Pobierz obecne harmonogramy HOME z Tesla
                 logger.info(f"{time_str} 📋 Pobieranie obecnych harmonogramów HOME...")
                 current_home_schedules = self._get_home_schedules_from_tesla(vehicle_vin)
-                
+
+                if current_home_schedules is None:
+                    # Bez wiedzy o obecnym stanie pojazdu nie można bezpiecznie
+                    # rekoncyliować — dodanie "na ślepo" tworzy duplikaty/osierocone okna
+                    logger.error(f"{time_str} ❌ Nie udało się odczytać obecnych harmonogramów — przerywam (retry w następnym cyklu)")
+                    return False
+
                 if current_home_schedules:
                     logger.info(f"{time_str} 📍 Znaleziono {len(current_home_schedules)} starych harmonogramów HOME")
                 else:
@@ -2646,25 +3023,52 @@ class CloudTeslaMonitor:
                 # 3. Rozwiąż nakładania harmonogramów (zachowaj kolejność priorytetów z API)
                 logger.info(f"{time_str} 🔍 Sprawdzanie nakładań harmonogramów...")
                 resolved_schedules = self._resolve_schedule_overlaps(new_schedules, vehicle_vin)
-                
+
+                # REKONCYLIACJA (idempotencja): porównaj pożądany stan z obecnym.
+                # Dodawaj tylko okna, których nie ma; usuwaj tylko te, które nie
+                # pasują do nowego planu. Retry po częściowej porażce oraz podwójny
+                # trigger nie duplikują wtedy okien w pojeździe.
+                schedules_to_add = [
+                    s for s in resolved_schedules
+                    if not any(self._schedule_content_matches(c, s) for c in current_home_schedules)
+                ]
+                # OCHRONA SPECIAL CHARGING: okna aktywnych/zaplanowanych sesji special
+                # nie podlegają wymieceniu przez zwykły cykl
+                protected_ids = self._get_protected_schedule_ids(vehicle_vin)
+                if protected_ids is None:
+                    logger.error(f"{time_str} ❌ Nie można ustalić chronionych harmonogramów special — przerywam (retry w następnym cyklu)")
+                    return False
+
+                schedules_to_remove = [
+                    c for c in current_home_schedules
+                    if c.get('id') not in protected_ids
+                    and not any(self._schedule_content_matches(c, s) for s in resolved_schedules)
+                ]
+
+                if not schedules_to_add and not schedules_to_remove:
+                    logger.info(f"{time_str} ✅ Stan pojazdu zgodny z planem — brak operacji do wykonania")
+                    return True
+
                 # NAPRAWKA: Szczegółowe logowanie harmonogramów przed dodaniem
-                logger.info(f"{time_str} 📋 Harmonogramy do dodania:")
-                for k, schedule in enumerate(resolved_schedules):
+                logger.info(f"{time_str} 📋 Harmonogramy do dodania ({len(schedules_to_add)}) / usunięcia ({len(schedules_to_remove)}):")
+                for k, schedule in enumerate(schedules_to_add):
                     start_time_display = self.tesla_controller.minutes_to_time(schedule.start_time) if schedule.start_time else "N/A"
                     end_time_display = self.tesla_controller.minutes_to_time(schedule.end_time) if schedule.end_time else "N/A"
-                    logger.info(f"   #{k+1}: {start_time_display}-{end_time_display} "
+                    logger.info(f"   +#{k+1}: {start_time_display}-{end_time_display} "
                               f"(minuty: {schedule.start_time}-{schedule.end_time}), "
                               f"enabled={schedule.enabled}")
-                
+                for k, old in enumerate(schedules_to_remove):
+                    logger.info(f"   -#{k+1}: ID={old.get('id')}, {old.get('start_time')}-{old.get('end_time')} min")
+
                 # 4. Dodaj nowe harmonogramy do Tesla (wymaga proxy)
-                logger.info(f"{time_str} ➕ Dodawanie {len(resolved_schedules)} nowych harmonogramów...")
+                logger.info(f"{time_str} ➕ Dodawanie {len(schedules_to_add)} nowych harmonogramów...")
                 
                 if proxy_started:
                     # Poczekaj na pełne uruchomienie proxy
                     logger.info(f"{time_str} ⏳ Oczekiwanie na stabilizację proxy (3s)...")
                     time.sleep(3)
                     
-                    addition_success = self._add_schedules_to_tesla(resolved_schedules, vehicle_vin)
+                    addition_success = self._add_schedules_to_tesla(schedules_to_add, vehicle_vin)
                     if addition_success:
                         logger.info(f"{time_str} ✅ Pomyślnie dodano nowe harmonogramy Tesla")
                         
@@ -2692,12 +3096,16 @@ class CloudTeslaMonitor:
                                           f"{start_display}-{end_display}, enabled={enabled}")
                         
                         # 5. NOWA SEKWENCJA: Usuń stare harmonogramy PO dodaniu nowych
-                        if current_home_schedules:
-                            logger.info(f"{time_str} 🗑️ Usuwanie {len(current_home_schedules)} starych harmonogramów HOME...")
-                            removal_success = self._remove_old_schedules_from_tesla(current_home_schedules, vehicle_vin)
+                        removal_success = True
+                        if schedules_to_remove:
+                            logger.info(f"{time_str} 🗑️ Usuwanie {len(schedules_to_remove)} starych harmonogramów HOME...")
+                            removal_success = self._remove_old_schedules_from_tesla(schedules_to_remove, vehicle_vin)
                             if not removal_success:
-                                logger.warning(f"{time_str} ⚠️ Nie wszystkie stare harmonogramy zostały usunięte")
-                                logger.info(f"{time_str} 💡 Nowe harmonogramy zostały dodane pomyślnie")
+                                # Częściowa porażka NIE jest sukcesem: pozostawione stare okna
+                                # (days=All) odpalą się w złych godzinach. Zwracamy False, żeby
+                                # hash nie został zatwierdzony i retry dokończył sprzątanie
+                                # (rekoncyliacja zapewnia, że retry nie zduplikuje dodanych okien).
+                                logger.error(f"{time_str} ❌ Nie wszystkie stare harmonogramy zostały usunięte — operacja NIEUDANA (retry dokończy)")
                             else:
                                 logger.info(f"{time_str} ✅ Pomyślnie usunięto stare harmonogramy HOME")
                         else:
@@ -2825,7 +3233,11 @@ class CloudTeslaMonitor:
         """
         try:
             home_schedules = self._get_home_schedules_from_tesla(vehicle_vin)
-            
+
+            if home_schedules is None:
+                logger.error(f"📍 Błąd odczytu harmonogramów HOME dla {vehicle_vin[-4:]} — nie można wyłączać")
+                return False
+
             if not home_schedules:
                 logger.info(f"📍 Brak harmonogramów HOME do wyłączenia dla {vehicle_vin[-4:]}")
                 return True
@@ -3229,9 +3641,11 @@ class CloudTeslaMonitor:
                         else:
                             logger.error(f"❌ Błąd usuwania starego harmonogramu ID: {schedule_id}")
                             
-                            # Sprawdź czy harmonogram nadal istnieje
+                            # Sprawdź czy harmonogram nadal istnieje.
+                            # Przy błędzie odczytu (None) załóż ostrożnie, że istnieje —
+                            # NIE wolno liczyć nieusuniętego okna jako sukces.
                             current_schedules = self._get_home_schedules_from_tesla(vehicle_vin)
-                            still_exists = any(s.get('id') == schedule_id for s in current_schedules)
+                            still_exists = current_schedules is None or any(s.get('id') == schedule_id for s in current_schedules)
                             if still_exists:
                                 logger.error(f"🔍 Stary harmonogram {schedule_id} nadal istnieje w Tesla")
                             else:
