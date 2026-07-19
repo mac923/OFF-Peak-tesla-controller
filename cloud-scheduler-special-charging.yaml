@@ -1,6 +1,17 @@
-# Cloud Scheduler Job dla Special Charging Daily Check
-# Sprawdza Google Sheets dla wyjątkowych potrzeb ładowania
-# Wykonywany codziennie o 00:01 czasu warszawskiego
+# ⛔ DEPRECATED — NIE WDRAŻAĆ TEGO JOBA.
+#
+# Special Charging daily check jest ZINTEGROWANY z midnight-wake
+# (cloud_tesla_worker.py: _handle_midnight_wake -> _perform_daily_special_charging_check),
+# uruchamianym przez job tesla-worker-daily-check o 00:00 Europe/Warsaw.
+# Osobny job o 00:01 powodował PODWÓJNE przetwarzanie sesji każdej nocy
+# (m.in. nadpisywanie original_charge_limit już podniesioną wartością).
+#
+# Jeśli job istnieje w projekcie, usuń go:
+#   gcloud scheduler jobs delete tesla-special-charging-daily-check --location=europe-west1
+#
+# Endpoint /daily-special-charging-check pozostaje dostępny do wywołań ręcznych/testów.
+#
+# --- Poniższa definicja zachowana wyłącznie jako referencja historyczna ---
 
 apiVersion: cloudscheduler.googleapis.com/v1
 kind: Job

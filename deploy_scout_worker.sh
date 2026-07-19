@@ -52,11 +52,13 @@ echo "✅ API włączone"
 # Sprawdź czy sekrety istnieją
 echo ""
 echo "🔐 Sprawdzanie sekretów..."
+# Lista zgodna z architekturą v3.1: tokeny Tesla żyją w 'fleet-tokens'
+# (osobny 'tesla-refresh-token' nie istnieje — centralne zarządzanie przez Worker)
 REQUIRED_SECRETS=(
     "tesla-client-id"
     "tesla-client-secret"
-    "tesla-refresh-token"
     "tesla-private-key"
+    "fleet-tokens"
     "OFF_PEAK_CHARGE_API_KEY"
     "WORKER_SERVICE_URL"
 )
@@ -75,14 +77,8 @@ done
 echo ""
 echo "🔍 === WDRAŻANIE SCOUT FUNCTION (LEKKA, TANIA) ==="
 
-# KROK 1.1: Usunięcie przestarzałego kopiowania plików.
-# Skrypt będzie teraz wdrażał bezpośrednio z katalogu scout_function_deploy,
-# który zawiera już poprawiony main.py i odpowiednie zależności.
-#
-# usunięto:
-# mkdir -p scout_function_deploy
-# cp tesla_scout_function.py scout_function_deploy/main.py
-# cp requirements_scout.txt scout_function_deploy/requirements.txt
+# JEDYNE ŹRÓDŁO Scout Function to scout_function_deploy/main.py.
+# Rootowy tesla_scout_function.py (starsza generacja) został usunięty z repo.
 
 # Wdrażaj Scout Function
 echo "🔍 Wdrażanie Scout Function z katalogu 'scout_function_deploy'..."
@@ -127,13 +123,6 @@ echo "✅ Worker Service wdrożona: $WORKER_SERVICE_URL"
 # === KROK 3: AKTUALIZACJA SCOUT FUNCTION Z URL WORKER ===
 echo ""
 echo "🔗 Aktualizacja Scout Function z URL Worker Service..."
-
-# KROK 3.1: Usunięcie przestarzałego kopiowania plików przy aktualizacji.
-#
-# usunięto:
-# mkdir -p scout_function_deploy
-# cp tesla_scout_function.py scout_function_deploy/main.py
-# cp requirements_scout.txt scout_function_deploy/requirements.txt
 
 gcloud functions deploy tesla-scout \
     --gen2 \
