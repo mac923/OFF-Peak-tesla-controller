@@ -80,7 +80,13 @@ spec:
         # OPTYMALIZACJA: URL jest stały - nie potrzebuje Secret Manager
         - name: OFF_PEAK_CHARGE_API_URL
           value: "https://off-peak-charge-v2.vercel.app/api/external-calculate"
-        
+        # Retry na OFF PEAK API — fallback dopiero po wyczerpaniu prób
+        - name: OFF_PEAK_API_MAX_ATTEMPTS
+          value: "3"
+        # Auto-stop ładowania poza oknem taniej taryfy (był shadow do 2026-07-20)
+        - name: CHARGE_STOP_ENFORCE
+          value: "true"
+
         # Special Charging - Google Sheets Integration
         - name: GOOGLE_SHEETS_URL
           valueFrom:

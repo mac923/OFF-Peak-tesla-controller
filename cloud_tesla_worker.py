@@ -2726,23 +2726,27 @@ class WorkerHealthCheckHandler(BaseHTTPRequestHandler):
             logger.info(f"🧹 [CLEANUP] Rozpoczynam czyszczenie przeterminowanych special charging sessions")
             logger.info(f"🧹 [CLEANUP] Aktualny czas Warsaw: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
-            # Znajdź wszystkie ACTIVE sessions
+            # Znajdź wszystkie ACTIVE i SCHEDULED sessions.
+            # WAŻNE: wcześniej filtrowano tylko status=='ACTIVE', przez co osierocone
+            # wpisy SCHEDULED (target dawno minął) nigdy nie były sprzątane i na stałe
+            # blokowały charge_stop w _has_active_special_session.
             sessions_ref = db.collection('special_charging_sessions')
-            active_sessions = list(sessions_ref.where('status', '==', 'ACTIVE').stream())
-            
-            logger.info(f"🧹 [CLEANUP] Znaleziono {len(active_sessions)} aktywnych sessions do sprawdzenia")
-            
+            active_sessions = list(sessions_ref.where('status', 'in', ['ACTIVE', 'SCHEDULED']).stream())
+
+            logger.info(f"🧹 [CLEANUP] Znaleziono {len(active_sessions)} aktywnych/zaplanowanych sessions do sprawdzenia")
+
             cleaned_count = 0
             zombie_sessions = []
-            
+
             for session_doc in active_sessions:
                 try:
                     session_data = session_doc.to_dict()
                     session_id = session_data.get('session_id', session_doc.id)
-                    charging_end_str = session_data.get('charging_end')
-                    
+                    # charging_end dla ACTIVE; SCHEDULED zwykle ma tylko target_datetime
+                    charging_end_str = session_data.get('charging_end') or session_data.get('target_datetime')
+
                     if not charging_end_str or charging_end_str == 'Unknown':
-                        logger.warning(f"⚠️ [CLEANUP] Session {session_id} bez charging_end - pomijam")
+                        logger.warning(f"⚠️ [CLEANUP] Session {session_id} bez charging_end/target_datetime - pomijam")
                         continue
                     
                     # Parse charging_end time

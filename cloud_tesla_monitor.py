@@ -784,13 +784,56 @@ class CloudTeslaMonitor:
             return None
 
     def _has_active_special_session(self, vehicle_vin: str) -> bool:
-        """True gdy w Firestore istnieje sesja special charging SCHEDULED/ACTIVE dla pojazdu."""
+        """
+        True gdy istnieje AKTUALNA sesja special charging SCHEDULED/ACTIVE dla pojazdu.
+
+        Sesje, których okno ładowania / target już minęły (z buforem), są traktowane
+        jako zombie i NIE liczą się jako aktywne — inaczej osierocone wpisy SCHEDULED
+        (cleanup dotykał tylko status ACTIVE) blokowałyby charge_stop na zawsze.
+        """
         if not self.firestore_client:
             return False
         try:
+            now = self._get_warsaw_time()
+            grace = timedelta(hours=int(os.getenv('SPECIAL_SESSION_GRACE_HOURS', '2')))
             sessions_ref = self.firestore_client.collection('special_charging_sessions')
             query = sessions_ref.where('vin', '==', vehicle_vin).where('status', 'in', ['ACTIVE', 'SCHEDULED'])
-            return len(list(query.stream())) > 0
+
+            for doc in query.stream():
+                data = doc.to_dict() or {}
+                # Efektywny koniec sesji: charging_end > target_datetime > charging_start
+                end_raw = data.get('charging_end') or data.get('target_datetime') or data.get('charging_start')
+                effective_end = None
+                if isinstance(end_raw, str):
+                    try:
+                        effective_end = datetime.fromisoformat(end_raw.replace('Z', '+00:00'))
+                        if effective_end.tzinfo is None:
+                            effective_end = self.timezone.localize(effective_end)
+                    except (ValueError, AttributeError):
+                        effective_end = None
+
+                if effective_end is not None:
+                    if effective_end + grace >= now:
+                        return True  # sesja wciąż aktualna
+                    continue  # zombie — okno minęło, pomijam
+
+                # Brak parsowalnego czasu: licz jako aktywną tylko gdy świeżo utworzona (≤24h)
+                created_raw = data.get('created_at')
+                if isinstance(created_raw, str):
+                    try:
+                        created = datetime.fromisoformat(created_raw.replace('Z', '+00:00'))
+                        if created.tzinfo is None:
+                            created = self.timezone.localize(created)
+                        if now - created <= timedelta(hours=24):
+                            return True
+                        continue
+                    except (ValueError, AttributeError):
+                        pass
+                # Nieznany czas i nieznany wiek — ostrożnie uznaj za aktywną
+                logger.warning(f"⚠️ Sesja special {doc.id} bez parsowalnego czasu — traktuję jako aktywną")
+                return True
+
+            return False
         except Exception as e:
             # Przy błędzie odczytu załóż ostrożnie, że sesja może istnieć —
             # lepiej nie zatrzymać special charging niż zatrzymać go błędnie
@@ -892,17 +935,42 @@ class CloudTeslaMonitor:
             Dict z odpowiedzią API lub fallback w przypadku błędu
         """
         
+        def _empty_fallback_response(reason: str) -> Dict[str, Any]:
+            """Fallback bez okna ładowania — konwerter założy okno-strażnik."""
+            return {
+                "success": True,
+                "fallback": True,
+                "fallback_reason": reason,
+                "data": {
+                    "summary": {"scheduledSlots": 0, "totalEnergy": 0, "totalCost": 0, "averagePrice": 0},
+                    "chargingSchedule": []
+                }
+            }
+
         def _create_fallback_response(reason: str) -> Dict[str, Any]:
             """
-            Fallback przy awarii OFF PEAK API: domyślne okno nocne (env
-            FALLBACK_CHARGE_START_HOUR/FALLBACK_CHARGE_END_HOUR, domyślnie 23-6).
+            Fallback przy awarii OFF PEAK API — ładowanie TYLKO do dolnej granicy
+            pasma (CHARGE_LIMIT_OPTIMAL_LOWER, ~50%), nie do pełna.
 
-            Czasy w pełnym ISO 8601 ze strefą — poprzedni format "13:00" nie
-            przechodził przez fromisoformat() w konwerterze i slot po cichu
-            znikał (pojazd zostawał z samym oknem-strażnikiem). Do tego 13:00-15:00
-            wypadało w godzinach szczytu cenowego.
+            - bateria ≥ floor → BRAK okna (zostaje strażnik); auto nie ładuje bez
+              potwierdzonego, taniego planu.
+            - bateria < floor → okno nocne (FALLBACK_CHARGE_START/END_HOUR, 23-6)
+              skrócone do czasu potrzebnego na dobicie do floora.
+
+            Wcześniej fallback ładował do pełna (11 kW × całe okno ~77 kWh) i
+            nadpisywał strażnika — pojedynczy blip API kosztował pełne ładowanie.
+            Czasy w pełnym ISO 8601 ze strefą (fromisoformat w konwerterze).
             """
-            logger.warning(f"⚠️ Tworzę fallback harmonogram nocny (powód: {reason})")
+            logger.warning(f"⚠️ Tworzę fallback (powód: {reason})")
+
+            capacity = float(os.getenv('VEHICLE_BATTERY_CAPACITY_KWH', '75'))
+            rate = float(os.getenv('VEHICLE_CHARGING_RATE_KW', '11'))
+            floor_frac = float(os.getenv('CHARGE_LIMIT_OPTIMAL_LOWER', '0.5'))
+
+            needed_kwh = max((floor_frac - battery_level / 100.0) * capacity, 0.0)
+            if needed_kwh <= 0.1 or rate <= 0:
+                logger.info(f"🔄 FALLBACK: bateria {battery_level}% ≥ floor {int(floor_frac*100)}% — NIE ładuję (zostaje strażnik)")
+                return _empty_fallback_response(reason)
 
             start_hour = int(os.getenv('FALLBACK_CHARGE_START_HOUR', '23'))
             end_hour = int(os.getenv('FALLBACK_CHARGE_END_HOUR', '6'))
@@ -913,32 +981,31 @@ class CloudTeslaMonitor:
             if now < end_today:
                 # Jesteśmy w trakcie okna nocnego (np. 01:30) — ładuj od teraz do końca okna
                 start_dt = now.replace(second=0, microsecond=0)
-                end_dt = end_today
+                window_end = end_today
             else:
                 # Dzień — zaplanuj najbliższą noc: dziś start_hour → jutro end_hour
                 start_dt = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
                 if start_dt <= now:
                     start_dt = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-                end_dt = (now + timedelta(days=1)).replace(hour=end_hour, minute=0, second=0, microsecond=0)
+                window_end = (now + timedelta(days=1)).replace(hour=end_hour, minute=0, second=0, microsecond=0)
 
-            duration_h = max((end_dt - start_dt).total_seconds() / 3600, 0)
-            logger.info(f"🔄 FALLBACK: okno nocne {start_dt.strftime('%Y-%m-%d %H:%M')} - {end_dt.strftime('%Y-%m-%d %H:%M')}")
+            # Skróć okno do czasu potrzebnego na dobicie do floora (cap długością nocy)
+            needed_h = needed_kwh / rate
+            end_dt = min(start_dt + timedelta(hours=needed_h), window_end)
+            actual_kwh = round(rate * max((end_dt - start_dt).total_seconds() / 3600, 0), 1)
+            logger.info(f"🔄 FALLBACK: okno {start_dt.strftime('%Y-%m-%d %H:%M')} - {end_dt.strftime('%H:%M')} "
+                        f"(dobicie {battery_level}% → ~{int(floor_frac*100)}%, ~{actual_kwh} kWh)")
 
             return {
                 "success": True,
                 "fallback": True,
                 "fallback_reason": reason,
                 "data": {
-                    "summary": {
-                        "scheduledSlots": 1,
-                        "totalEnergy": round(11 * duration_h, 1),  # ~11 kW * czas okna
-                        "totalCost": 0,
-                        "averagePrice": 0
-                    },
+                    "summary": {"scheduledSlots": 1, "totalEnergy": actual_kwh, "totalCost": 0, "averagePrice": 0},
                     "chargingSchedule": [{
                         "start_time": start_dt.isoformat(),
                         "end_time": end_dt.isoformat(),
-                        "charge_amount": round(11 * duration_h, 1),
+                        "charge_amount": actual_kwh,
                         "cost": 0
                     }]
                 }
@@ -990,15 +1057,42 @@ class CloudTeslaMonitor:
             logger.info(f"{time_str} 🔄 Wywołuję OFF PEAK CHARGE API")
             logger.info(f"URL: {api_url}")
             logger.info(f"Dane: {json.dumps(request_data, indent=2)}")
-            
-            # Wykonaj żądanie HTTP POST z timeout'em
-            response = requests.post(
-                api_url,
-                json=request_data,
-                headers=headers,
-                timeout=30  # 30 sekund timeout
-            )
-            
+
+            # Retry z backoffem: pojedynczy przejściowy błąd (SSL EOF, timeout,
+            # 5xx, 429) NIE może odpalać agresywnego fallbacku — fallback dopiero
+            # po wyczerpaniu prób. Bez tego jeden blip Vercela instalował okno
+            # nocne 23:00-06:00 (pełne ładowanie) zamiast realnego planu.
+            max_attempts = max(int(os.getenv('OFF_PEAK_API_MAX_ATTEMPTS', '3')), 1)
+            backoff_base = float(os.getenv('OFF_PEAK_API_BACKOFF_SECONDS', '2'))
+            response = None
+            last_error = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = requests.post(
+                        api_url,
+                        json=request_data,
+                        headers=headers,
+                        timeout=30  # 30 sekund timeout
+                    )
+                except requests.exceptions.RequestException as e:
+                    last_error = f"błąd połączenia: {str(e)}"
+                    logger.warning(f"{time_str} ⚠️ OFF PEAK API próba {attempt}/{max_attempts} — {last_error}")
+                    response = None
+                else:
+                    # Retry tylko na przejściowych statusach; 4xx (poza 429) nie naprawi się sam
+                    if response.status_code == 200 or (response.status_code < 500 and response.status_code != 429):
+                        break
+                    last_error = f"błąd HTTP {response.status_code}"
+                    logger.warning(f"{time_str} ⚠️ OFF PEAK API próba {attempt}/{max_attempts} — {last_error}")
+
+                if attempt < max_attempts:
+                    time.sleep(backoff_base * (2 ** (attempt - 1)))  # 2s, 4s, ...
+
+            if response is None:
+                # Wszystkie próby padły na poziomie połączenia
+                logger.error(f"❌ Błąd połączenia z OFF PEAK CHARGE API po {max_attempts} próbach: {last_error}")
+                return _create_fallback_response(last_error or "błąd połączenia")
+
             # Sprawdź status odpowiedzi
             if response.status_code == 200:
                 response_data = response.json()

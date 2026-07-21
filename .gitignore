@@ -184,3 +184,5 @@ Desktop.ini
 # Logs
 *.log
 logs/ 
+# Generowany artefakt deployu (digest wstrzykiwany przez deploy_scout_worker.sh)
+cloud-run-service-worker-filled.yaml
